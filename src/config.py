@@ -57,10 +57,21 @@ class ProjectConfig:
 
 @dataclass
 class ChannelConfig:
-    project: str
+    # Optional: a guruDecline-only channel never touches process_question(), so
+    # it has no codebase project to search and doesn't need one configured.
+    project: str = ""
     agent: str = "ProductLens"
     mode: str = "auto"
     triggers: Dict[str, bool] = field(default_factory=dict)
+    # Slack user ID to DM when the guruDecline trigger fires. Required for any
+    # channel with guruDecline enabled -- there is no auto-post path (by design).
+    notify_user_id: Optional[str] = None
+
+
+@dataclass
+class BetterBrainConfig:
+    repo_path: Path
+    cli_timeout_seconds: int = 150
 
 
 @dataclass
@@ -72,6 +83,7 @@ class Config:
     projects: Dict[str, ProjectConfig]
     channels: Dict[str, ChannelConfig]
     projects_dir: Path
+    betterbrain: Optional[BetterBrainConfig] = None
 
 
 def load_config(config_path: str = "config.yaml") -> Config:
@@ -159,16 +171,26 @@ def load_config(config_path: str = "config.yaml") -> Config:
     channels = {}
     for channel_id, chan_data in channels_data.items():
         channels[channel_id] = ChannelConfig(
-            project=chan_data["project"],
+            project=chan_data.get("project", ""),
             agent=chan_data.get("agent", "ProductLens"),
             mode=chan_data.get("mode", "auto"),
             triggers=chan_data.get("triggers", {}),
+            notify_user_id=chan_data.get("notifyUserId"),
         )
-    
+
+    # Load BetterBrain config (only needed for channels using the guruDecline trigger)
+    betterbrain_data = data.get("betterbrain")
+    betterbrain = None
+    if betterbrain_data:
+        betterbrain = BetterBrainConfig(
+            repo_path=Path(betterbrain_data["repoPath"]).expanduser(),
+            cli_timeout_seconds=betterbrain_data.get("cliTimeoutSeconds", 150),
+        )
+
     # Projects directory
     projects_dir = Path(__file__).parent.parent / "projects"
     projects_dir.mkdir(exist_ok=True)
-    
+
     return Config(
         slack=slack,
         llm=llm,
@@ -177,4 +199,5 @@ def load_config(config_path: str = "config.yaml") -> Config:
         projects=projects,
         channels=channels,
         projects_dir=projects_dir,
+        betterbrain=betterbrain,
     )

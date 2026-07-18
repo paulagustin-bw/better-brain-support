@@ -89,3 +89,40 @@ channels:
     triggers:
       appMention: true
       questionLikeMessages: false
+  # #product -- where the real Holly/Kate/Guru example happened, 2026-07-18.
+  # guruDecline-only: no project/agent, since it never calls the ProductLens
+  # codebase-search path -- see process_guru_decline() in src/slack/handler.py.
+  C033TEH2T:
+    triggers:
+      appMention: false
+      questionLikeMessages: false
+      guruDecline: true
+    notifyUserId: U046SR718  # Paul Agustin -- confirmed directly, 2026-07-18. DM only, never posts to the channel.
+  # #engage_product
+  CU207A35G:
+    triggers:
+      appMention: false
+      questionLikeMessages: false
+      guruDecline: true
+    notifyUserId: U046SR718
+  # #support
+  C0JFS90JE:
+    triggers:
+      appMention: false
+      questionLikeMessages: false
+      guruDecline: true
+    notifyUserId: U046SR718
+  # #tmp_better_brain_support_articles
+  C0BC58PEQD9:
+    triggers:
+      appMention: false
+      questionLikeMessages: false
+      guruDecline: true
+    notifyUserId: U046SR718
+
+# v0 scope: BetterBrain's search+escalation runs headlessly (read-only), but
+# gap-logging and PKR-drafting stay a deliberate, interactive follow-up action --
+# see .claude/settings.json in the BetterBrain repo and SKILL.md's own notes.
+betterbrain:
+  repoPath: /Users/paulagustin/Documents/BetterBrain
+  cliTimeoutSeconds: 280
