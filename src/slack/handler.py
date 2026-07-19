@@ -173,10 +173,12 @@ def should_process_event(event: Dict[str, Any], config: Config) -> bool:
     if event_type == "app_mention" and triggers.get("appMention", True):
         return True
 
-    # An article command may arrive as a plain `message` (when only
+    # An article/author command may arrive as a plain `message` (when only
     # message.channels is subscribed, not app_mention) -- accept it either way as
     # long as the channel has mentions enabled.
-    if triggers.get("appMention", False) and parse_article_command(event.get("text", "")):
+    if triggers.get("appMention", False) and (
+        parse_article_command(event.get("text", "")) or parse_author_command(event.get("text", ""))
+    ):
         return True
 
     if event_type == "message" and triggers.get("questionLikeMessages", False):
@@ -252,6 +254,8 @@ def handle(event: Dict[str, Any], headers: Dict[str, str], body: str) -> Dict[st
     try:
         if normalized_event.get("is_bot_message"):
             process_guru_decline(normalized_event, config)
+        elif parse_author_command(normalized_event.get("text", "")):
+            process_author_request(normalized_event, config)
         elif parse_article_command(normalized_event.get("text", "")):
             process_article_request(normalized_event, config)
         else:
@@ -627,6 +631,114 @@ def process_article_request(event: Dict[str, Any], config: Config):
     logger.info(f"Generated article scaffold '{slug}' for topic: {cmd['topic'][:80]}")
 
 
+AUTHOR_CMD_RE = re.compile(
+    r"\b(?:write(?:\s+it|\s+the\s+article|\s+article|\s+up)?|author(?:\s+article)?)\b[:\s]+"
+    r"([a-z0-9][a-z0-9-]{4,})",
+    re.IGNORECASE,
+)
+AUTHOR_TIMEOUT_SECONDS = 900  # full authoring pass can run several minutes
+
+
+def parse_author_command(text: str) -> Optional[str]:
+    """Parse `@BetterBrain write it: <article-slug>` -> the slug, else None."""
+    stripped = re.sub(r"<@[^>]+>", "", text or "").strip()
+    m = AUTHOR_CMD_RE.search(stripped)
+    return m.group(1).strip().lower() if m else None
+
+
+def _chunk_text(text: str, size: int) -> list:
+    """Split on line boundaries into <=size chunks for Slack message limits."""
+    chunks, cur = [], ""
+    for line in text.splitlines(keepends=True):
+        if cur and len(cur) + len(line) > size:
+            chunks.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def process_author_request(event: Dict[str, Any], config: Config):
+    """Author the finished article from an existing scaffold via the /author-article
+    skill (headless claude -p with acceptEdits so it can write its output), then post
+    the draft back to the thread. Draft-only: the skill leaves [SCREENSHOT]/[VERIFY]
+    markers and PKR citations; nothing is published. A human still reviews + publishes."""
+    channel = event["channel"]
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    responder = SlackResponder(config.slack.bot_token)
+
+    slug = parse_author_command(event.get("text", ""))
+    if not slug:
+        responder.post_message(
+            channel,
+            "Usage: `@BetterBrain write it: <article-slug>` — the slug from a scaffold "
+            "(e.g. `recognition-badges-nextgen`).",
+            thread_ts=thread_ts,
+        )
+        return
+
+    bb = config.betterbrain
+    if not bb:
+        responder.post_message(channel, "BetterBrain repo isn't configured.", thread_ts=thread_ts)
+        return
+
+    drafts = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
+    scaffold = drafts / f"{slug}.scaffold.md"
+    if not scaffold.exists():
+        responder.post_message(
+            channel,
+            f"No scaffold `{slug}.scaffold.md` found — generate it first with "
+            f"`@BetterBrain draft article: <topic>`.",
+            thread_ts=thread_ts,
+        )
+        return
+
+    responder.post_message(
+        channel,
+        f"✍️ Authoring the full draft for `{slug}` from its scaffold — runs the model, ~3-10 min…",
+        thread_ts=thread_ts,
+    )
+
+    try:
+        result = subprocess.run(
+            ["claude", "-p", f"/author-article {slug}", "--permission-mode", "acceptEdits"],
+            cwd=str(bb.repo_path), capture_output=True, text=True, timeout=AUTHOR_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        responder.post_message(channel, f"❌ Authoring timed out after {AUTHOR_TIMEOUT_SECONDS}s.", thread_ts=thread_ts)
+        return
+    except FileNotFoundError:
+        responder.post_message(channel, "❌ `claude` CLI not found on this machine.", thread_ts=thread_ts)
+        return
+
+    out_md = drafts / f"{slug}.md"
+    if not out_md.exists():
+        responder.post_message(
+            channel,
+            f"Authoring ran (exit {result.returncode}) but produced no `{slug}.md`.\n"
+            f"```{((result.stdout or '') + (result.stderr or ''))[-600:]}```",
+            thread_ts=thread_ts,
+        )
+        return
+
+    article = out_md.read_text()
+    responder.post_message(channel, f"✅ *Draft article authored:* `{slug}` ({len(article)} chars)", thread_ts=thread_ts)
+    for chunk in _chunk_text(article, 3500):
+        responder.post_message(channel, "```" + chunk + "```", thread_ts=thread_ts)
+    # The skill prints a 5-line summary to stdout -- surface it.
+    summary = (result.stdout or "").strip()
+    if summary:
+        responder.post_message(channel, "*Author notes:*\n" + summary[-1500:], thread_ts=thread_ts)
+    responder.post_message(
+        channel,
+        "_Still a DRAFT — capture the `[SCREENSHOT]` markers, resolve any `[VERIFY:]` flags, and "
+        "review before publishing. `<!-- PKR-xxx -->` citations strip at publish._",
+        thread_ts=thread_ts,
+    )
+    logger.info(f"Authored article '{slug}' ({len(article)} chars)")
+
+
 def process_guru_decline(event: Dict[str, Any], config: Config):
     """Handle a Guru decline: run the BetterBrain cascade and DM the result to a
     human reviewer. Deliberately does NOT reply in the original thread -- nothing
@@ -646,6 +758,12 @@ def process_guru_decline(event: Dict[str, Any], config: Config):
     question = fetch_parent_message_text(config.slack.bot_token, channel, parent_ts)
     if not question:
         logger.warning(f"Could not fetch parent question for {channel}/{parent_ts}")
+        return
+
+    # Guru also replies to our own bot commands (draft-article / write-it requests);
+    # those aren't genuine unanswered user questions, so don't cascade on them.
+    if parse_article_command(question) or parse_author_command(question):
+        logger.info(f"Guru replied to a bot command in {channel}; not a real gap, skipping cascade")
         return
 
     # Guru's reply reached us; let a model decide if it actually declined/hedged
