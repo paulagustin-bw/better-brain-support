@@ -578,8 +578,9 @@ def process_article_request(event: Dict[str, Any], config: Config):
 
     responder.post_message(
         channel,
-        f"📝 Drafting a *{cmd['tmpl']}* scaffold for *{cmd['topic']}*"
-        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''} — matching + reranking the PKR corpus, ~40s…",
+        f"📝 Drafting a *{cmd['tmpl']}* article for *{cmd['topic']}*"
+        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''} — matching PKRs, then writing the "
+        "full draft. ~5-12 min…",
         thread_ts=thread_ts,
     )
 
@@ -604,7 +605,7 @@ def process_article_request(event: Dict[str, Any], config: Config):
         )
         return
 
-    m = re.search(r"^\s*([a-z0-9][a-z0-9-]+):\s+closed=", result.stdout, re.MULTILINE)
+    m = re.search(r"^\s*([a-z0-9][a-z0-9-]+):\s+closed=(\d+)", result.stdout, re.MULTILINE)
     if not m:
         responder.post_message(
             channel, f"Generated, but couldn't locate the output:\n```{result.stdout[-600:]}```",
@@ -613,28 +614,34 @@ def process_article_request(event: Dict[str, Any], config: Config):
         return
 
     slug = m.group(1)
+    closed = int(m.group(2))
     summary = m.group(0).strip()
     out_dir = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
     scaffold_f = out_dir / f"{slug}.scaffold.md"
     gaps_f = out_dir / f"{slug}.gaps.md"
+    logger.info(f"Generated scaffold '{slug}' for '{cmd['topic'][:80]}' (closed={closed})")
 
-    responder.post_message(channel, f"✅ *Scaffold ready:* `{slug}`\n`{summary}`", thread_ts=thread_ts)
+    responder.post_message(channel, f"📄 Matched *{closed}* PKR(s) for `{slug}`. `{summary}`", thread_ts=thread_ts)
     if gaps_f.exists():
         responder.post_message(channel, "*Gap manifest — what's covered vs. missing:*", thread_ts=thread_ts)
         _deliver_doc(responder, channel, thread_ts, f"{slug}.gaps.md", f"{slug} — gap manifest", gaps_f.read_text())
-    if scaffold_f.exists():
+
+    # Zero-coverage guard: don't spend a full authoring pass on a topic the corpus
+    # barely covers -- hand back the scaffold and let a human decide instead.
+    if closed == 0:
         responder.post_message(
-            channel, "*Scaffold — fill the [AUTHOR] stubs, then `@BetterBrain write it: " + slug + "`:*",
+            channel,
+            "The corpus has ~no durable knowledge on this yet, so I'm not auto-writing it. "
+            f"Scaffold attached; add PKR coverage, or force it with `@BetterBrain write it: {slug}`.",
             thread_ts=thread_ts,
         )
-        _deliver_doc(responder, channel, thread_ts, f"{slug}.scaffold.md", f"{slug} — scaffold", scaffold_f.read_text())
-    responder.post_message(
-        channel,
-        "_Draft only — not published anywhere. Review, author the prose, and publish through the "
-        "normal flow._",
-        thread_ts=thread_ts,
-    )
-    logger.info(f"Generated article scaffold '{slug}' for topic: {cmd['topic'][:80]}")
+        if scaffold_f.exists():
+            _deliver_doc(responder, channel, thread_ts, f"{slug}.scaffold.md", f"{slug} — scaffold", scaffold_f.read_text())
+        return
+
+    # One-step: go straight from scaffold to the finished draft.
+    responder.post_message(channel, f"✍️ Now writing the full draft for `{slug}` — ~3-10 min…", thread_ts=thread_ts)
+    _author_and_deliver(responder, channel, thread_ts, bb, slug)
 
 
 AUTHOR_CMD_RE = re.compile(
@@ -675,11 +682,48 @@ def _deliver_doc(responder, channel, thread_ts, filename: str, title: str, conte
         responder.post_message(channel, "```" + chunk + "```", thread_ts=thread_ts)
 
 
+def _author_and_deliver(responder, channel, thread_ts, bb, slug: str) -> bool:
+    """Run /author-article on an existing scaffold (headless claude -p + acceptEdits so
+    it can write its output) and post the finished draft. Draft-only: keeps
+    [SCREENSHOT]/[VERIFY] markers + PKR citations; nothing is published. Assumes
+    <slug>.scaffold.md exists. Returns True on success."""
+    drafts = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
+    summary = _run_claude(
+        f"/author-article {slug}", cwd=str(bb.repo_path), timeout=AUTHOR_TIMEOUT_SECONDS,
+        extra_args=["--permission-mode", "acceptEdits"], label="author-article",
+    )
+    if summary is None:
+        responder.post_message(channel, "❌ Authoring failed or timed out.", thread_ts=thread_ts)
+        return False
+
+    out_md = drafts / f"{slug}.md"
+    if not out_md.exists():
+        responder.post_message(
+            channel,
+            f"Authoring ran but produced no `{slug}.md`.\n```{(summary or '')[-600:]}```",
+            thread_ts=thread_ts,
+        )
+        return False
+
+    article = out_md.read_text()
+    responder.post_message(channel, f"✅ *Draft article:* `{slug}` ({len(article)} chars)", thread_ts=thread_ts)
+    _deliver_doc(responder, channel, thread_ts, f"{slug}.md", f"{slug} (draft article)", article)
+    if summary and summary.strip():
+        responder.post_message(channel, "*Author notes:*\n" + summary.strip()[-1500:], thread_ts=thread_ts)
+    responder.post_message(
+        channel,
+        "_Still a DRAFT — capture the `[SCREENSHOT]` markers, resolve any `[VERIFY:]` flags, and "
+        "review before publishing. `<!-- PKR-xxx -->` citations strip at publish._",
+        thread_ts=thread_ts,
+    )
+    logger.info(f"Authored article '{slug}' ({len(article)} chars)")
+    return True
+
+
 def process_author_request(event: Dict[str, Any], config: Config):
-    """Author the finished article from an existing scaffold via the /author-article
-    skill (headless claude -p with acceptEdits so it can write its output), then post
-    the draft back to the thread. Draft-only: the skill leaves [SCREENSHOT]/[VERIFY]
-    markers and PKR citations; nothing is published. A human still reviews + publishes."""
+    """Re-author an EXISTING scaffold via `@BetterBrain write it: <slug>` -- the power
+    path for when someone edited a scaffold and wants to regenerate the prose. The main
+    flow (draft article) already authors in one step; this is the manual re-run."""
     channel = event["channel"]
     thread_ts = event.get("thread_ts") or event.get("ts")
     responder = SlackResponder(config.slack.bot_token)
@@ -688,7 +732,7 @@ def process_author_request(event: Dict[str, Any], config: Config):
     if not slug:
         responder.post_message(
             channel,
-            "Usage: `@BetterBrain write it: <article-slug>` — the slug from a scaffold "
+            "Usage: `@BetterBrain write it: <article-slug>` — re-author an existing scaffold "
             "(e.g. `recognition-badges-nextgen`).",
             thread_ts=thread_ts,
         )
@@ -699,53 +743,20 @@ def process_author_request(event: Dict[str, Any], config: Config):
         responder.post_message(channel, "BetterBrain repo isn't configured.", thread_ts=thread_ts)
         return
 
-    drafts = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
-    scaffold = drafts / f"{slug}.scaffold.md"
+    scaffold = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts" / f"{slug}.scaffold.md"
     if not scaffold.exists():
         responder.post_message(
             channel,
-            f"No scaffold `{slug}.scaffold.md` found — generate it first with "
-            f"`@BetterBrain draft article: <topic>`.",
+            f"No scaffold `{slug}.scaffold.md` found — generate it with "
+            f"`@BetterBrain draft article: <topic>` (which now writes the draft too).",
             thread_ts=thread_ts,
         )
         return
 
     responder.post_message(
-        channel,
-        f"✍️ Authoring the full draft for `{slug}` from its scaffold — runs the model, ~3-10 min…",
-        thread_ts=thread_ts,
+        channel, f"✍️ Re-authoring `{slug}` from its scaffold — ~3-10 min…", thread_ts=thread_ts,
     )
-
-    summary = _run_claude(
-        f"/author-article {slug}", cwd=str(bb.repo_path), timeout=AUTHOR_TIMEOUT_SECONDS,
-        extra_args=["--permission-mode", "acceptEdits"], label="author-article",
-    )
-    if summary is None:
-        responder.post_message(channel, "❌ Authoring failed or timed out.", thread_ts=thread_ts)
-        return
-
-    out_md = drafts / f"{slug}.md"
-    if not out_md.exists():
-        responder.post_message(
-            channel,
-            f"Authoring ran but produced no `{slug}.md`.\n```{(summary or '')[-600:]}```",
-            thread_ts=thread_ts,
-        )
-        return
-
-    article = out_md.read_text()
-    responder.post_message(channel, f"✅ *Draft article authored:* `{slug}` ({len(article)} chars)", thread_ts=thread_ts)
-    _deliver_doc(responder, channel, thread_ts, f"{slug}.md", f"{slug} (draft article)", article)
-    # The skill's 5-line summary comes back as the claude result text -- surface it.
-    if summary and summary.strip():
-        responder.post_message(channel, "*Author notes:*\n" + summary.strip()[-1500:], thread_ts=thread_ts)
-    responder.post_message(
-        channel,
-        "_Still a DRAFT — capture the `[SCREENSHOT]` markers, resolve any `[VERIFY:]` flags, and "
-        "review before publishing. `<!-- PKR-xxx -->` citations strip at publish._",
-        thread_ts=thread_ts,
-    )
-    logger.info(f"Authored article '{slug}' ({len(article)} chars)")
+    _author_and_deliver(responder, channel, thread_ts, bb, slug)
 
 
 def process_guru_decline(event: Dict[str, Any], config: Config):
