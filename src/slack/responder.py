@@ -134,3 +134,42 @@ class SlackResponder:
         except Exception as e:
             logger.error(f"Failed to update message: {e}")
             return {"ok": False, "error": str(e)}
+
+    def upload_file(self, channel: str, content: str, filename: str,
+                    title: Optional[str] = None, thread_ts: Optional[str] = None) -> bool:
+        """Upload a text file to a channel/thread via Slack's external-upload flow
+        (getUploadURLExternal -> PUT -> completeUploadExternal). Requires the
+        files:write scope. Returns True on success, False otherwise so the caller
+        can fall back to posting the content as text."""
+        headers = {"Authorization": f"Bearer {self.bot_token}"}
+        data = content.encode("utf-8")
+        try:
+            r1 = requests.get(
+                f"{self.base_url}/files.getUploadURLExternal", headers=headers,
+                params={"filename": filename, "length": len(data)}, timeout=10,
+            ).json()
+            if not r1.get("ok"):
+                logger.warning(f"files.getUploadURLExternal failed: {r1.get('error')}")
+                return False
+            put = requests.post(r1["upload_url"], data=data, timeout=30)
+            if put.status_code != 200:
+                logger.warning(f"file upload PUT failed: {put.status_code}")
+                return False
+            payload: Dict[str, Any] = {
+                "files": [{"id": r1["file_id"], "title": title or filename}],
+                "channel_id": channel,
+            }
+            if thread_ts:
+                payload["thread_ts"] = thread_ts
+            r3 = requests.post(
+                f"{self.base_url}/files.completeUploadExternal",
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload, timeout=10,
+            ).json()
+            if not r3.get("ok"):
+                logger.warning(f"files.completeUploadExternal failed: {r3.get('error')}")
+                return False
+            return True
+        except requests.RequestException as e:
+            logger.warning(f"file upload error: {e}")
+            return False

@@ -389,6 +389,42 @@ def fetch_parent_message_text(bot_token: str, channel: str, parent_ts: str) -> O
     return messages[0].get("text") or None
 
 
+def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[list] = None,
+                label: str = "claude") -> Optional[str]:
+    """Run `claude -p` with --output-format json so every subscription-billed call
+    logs its token usage + cost (these all draw on the Claude Max plan, so we want
+    visibility as the team hammers the POC). Returns the result text, or None on
+    timeout / missing CLI / non-zero exit / unparseable output (callers treat None
+    as failure and fall back)."""
+    argv = ["claude", "-p", prompt, "--output-format", "json"] + (extra_args or [])
+    try:
+        result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.error(f"claude -p timed out ({label})")
+        return None
+    except FileNotFoundError:
+        logger.error("`claude` CLI not found on PATH -- is Claude Code installed on this machine?")
+        return None
+    if result.returncode != 0:
+        logger.error(f"claude -p exited {result.returncode} ({label}): {result.stderr[:400]}")
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"claude -p output not JSON ({label}); treating as failure")
+        return None
+    usage = data.get("usage") or {}
+    logger.info(
+        f"[usage] {label}: in={usage.get('input_tokens')} out={usage.get('output_tokens')} "
+        f"cache_read={usage.get('cache_read_input_tokens')} cost=${data.get('total_cost_usd')} "
+        f"turns={data.get('num_turns')} {data.get('duration_ms')}ms (Max subscription)"
+    )
+    if data.get("is_error"):
+        logger.error(f"claude -p returned is_error ({label}): {str(data.get('result'))[:300]}")
+        return None
+    return data.get("result")
+
+
 def run_betterbrain_cascade(question: str, betterbrain_config) -> Optional[str]:
     """Run the /betterbrain-ask skill headlessly against the given question.
 
@@ -402,28 +438,11 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Optional[str]:
     if not betterbrain_config:
         logger.error("No betterbrain config set -- cannot run cascade")
         return None
-
-    try:
-        result = subprocess.run(
-            ["claude", "-p", f"/betterbrain-ask {question}"],
-            cwd=str(betterbrain_config.repo_path),
-            capture_output=True,
-            text=True,
-            timeout=betterbrain_config.cli_timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("betterbrain-ask cascade timed out")
-        return None
-    except FileNotFoundError:
-        logger.error("`claude` CLI not found on PATH -- is Claude Code installed on this machine?")
-        return None
-
-    if result.returncode != 0:
-        logger.error(f"betterbrain-ask exited {result.returncode}: {result.stderr[:500]}")
-        return None
-
-    answer = (result.stdout or "").strip()
-    return answer or None
+    answer = _run_claude(
+        f"/betterbrain-ask {question}", cwd=str(betterbrain_config.repo_path),
+        timeout=betterbrain_config.cli_timeout_seconds, label="cascade",
+    )
+    return (answer or "").strip() or None
 
 
 DECLINE_CLASSIFIER_PROMPT = (
@@ -446,22 +465,12 @@ def guru_response_is_decline(question: str, guru_text: str, betterbrain_config) 
         question=(question or "")[:1500], guru=(guru_text or "")[:4000]
     )
     cwd = str(betterbrain_config.repo_path) if betterbrain_config else None
-    try:
-        result = subprocess.run(
-            ["claude", "-p", prompt, "--model", "haiku"],
-            cwd=cwd, capture_output=True, text=True, timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        logger.warning("decline classifier timed out; falling back to keyword match")
-        return looks_like_guru_decline(guru_text)
-    except FileNotFoundError:
-        logger.error("`claude` CLI not found for decline classifier; keyword fallback")
-        return looks_like_guru_decline(guru_text)
-    if result.returncode != 0:
-        logger.warning(f"decline classifier exited {result.returncode}; keyword fallback")
+    out = _run_claude(prompt, cwd=cwd, timeout=60, extra_args=["--model", "haiku"],
+                      label="decline-classifier")
+    if out is None:  # any failure -> keyword fallback, never regress
         return looks_like_guru_decline(guru_text)
 
-    verdict = (result.stdout or "").strip().upper()
+    verdict = out.strip().upper()
     tokens = verdict.split()
     last = tokens[-1] if tokens else ""
     if last == "DECLINE":
@@ -611,21 +620,18 @@ def process_article_request(event: Dict[str, Any], config: Config):
 
     responder.post_message(channel, f"✅ *Scaffold ready:* `{slug}`\n`{summary}`", thread_ts=thread_ts)
     if gaps_f.exists():
-        responder.post_message(
-            channel, "*Gap manifest — what's covered vs. missing:*\n```"
-            + gaps_f.read_text()[:1800] + "```",
-            thread_ts=thread_ts,
-        )
+        responder.post_message(channel, "*Gap manifest — what's covered vs. missing:*", thread_ts=thread_ts)
+        _deliver_doc(responder, channel, thread_ts, f"{slug}.gaps.md", f"{slug} — gap manifest", gaps_f.read_text())
     if scaffold_f.exists():
         responder.post_message(
-            channel, "*Scaffold — fill the [AUTHOR] stubs, then run `/author-article`:*\n```"
-            + scaffold_f.read_text()[:2600] + "```",
+            channel, "*Scaffold — fill the [AUTHOR] stubs, then `@BetterBrain write it: " + slug + "`:*",
             thread_ts=thread_ts,
         )
+        _deliver_doc(responder, channel, thread_ts, f"{slug}.scaffold.md", f"{slug} — scaffold", scaffold_f.read_text())
     responder.post_message(
         channel,
         "_Draft only — not published anywhere. Review, author the prose, and publish through the "
-        "normal flow. Full files on the mini at `knowledge-corpus/generated/article-drafts/`._",
+        "normal flow._",
         thread_ts=thread_ts,
     )
     logger.info(f"Generated article scaffold '{slug}' for topic: {cmd['topic'][:80]}")
@@ -657,6 +663,16 @@ def _chunk_text(text: str, size: int) -> list:
     if cur:
         chunks.append(cur)
     return chunks
+
+
+def _deliver_doc(responder, channel, thread_ts, filename: str, title: str, content: str) -> None:
+    """Deliver a generated doc as an uploaded .md file when the workspace grants
+    files:write; otherwise fall back to chunked code-block messages so it still
+    arrives. Uploading is much nicer than raw chunked markdown for scaffolds/articles."""
+    if responder.upload_file(channel, content, filename, title=title, thread_ts=thread_ts):
+        return
+    for chunk in _chunk_text(content, 3500):
+        responder.post_message(channel, "```" + chunk + "```", thread_ts=thread_ts)
 
 
 def process_author_request(event: Dict[str, Any], config: Config):
@@ -700,36 +716,29 @@ def process_author_request(event: Dict[str, Any], config: Config):
         thread_ts=thread_ts,
     )
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", f"/author-article {slug}", "--permission-mode", "acceptEdits"],
-            cwd=str(bb.repo_path), capture_output=True, text=True, timeout=AUTHOR_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
-        responder.post_message(channel, f"❌ Authoring timed out after {AUTHOR_TIMEOUT_SECONDS}s.", thread_ts=thread_ts)
-        return
-    except FileNotFoundError:
-        responder.post_message(channel, "❌ `claude` CLI not found on this machine.", thread_ts=thread_ts)
+    summary = _run_claude(
+        f"/author-article {slug}", cwd=str(bb.repo_path), timeout=AUTHOR_TIMEOUT_SECONDS,
+        extra_args=["--permission-mode", "acceptEdits"], label="author-article",
+    )
+    if summary is None:
+        responder.post_message(channel, "❌ Authoring failed or timed out.", thread_ts=thread_ts)
         return
 
     out_md = drafts / f"{slug}.md"
     if not out_md.exists():
         responder.post_message(
             channel,
-            f"Authoring ran (exit {result.returncode}) but produced no `{slug}.md`.\n"
-            f"```{((result.stdout or '') + (result.stderr or ''))[-600:]}```",
+            f"Authoring ran but produced no `{slug}.md`.\n```{(summary or '')[-600:]}```",
             thread_ts=thread_ts,
         )
         return
 
     article = out_md.read_text()
     responder.post_message(channel, f"✅ *Draft article authored:* `{slug}` ({len(article)} chars)", thread_ts=thread_ts)
-    for chunk in _chunk_text(article, 3500):
-        responder.post_message(channel, "```" + chunk + "```", thread_ts=thread_ts)
-    # The skill prints a 5-line summary to stdout -- surface it.
-    summary = (result.stdout or "").strip()
-    if summary:
-        responder.post_message(channel, "*Author notes:*\n" + summary[-1500:], thread_ts=thread_ts)
+    _deliver_doc(responder, channel, thread_ts, f"{slug}.md", f"{slug} (draft article)", article)
+    # The skill's 5-line summary comes back as the claude result text -- surface it.
+    if summary and summary.strip():
+        responder.post_message(channel, "*Author notes:*\n" + summary.strip()[-1500:], thread_ts=thread_ts)
     responder.post_message(
         channel,
         "_Still a DRAFT — capture the `[SCREENSHOT]` markers, resolve any `[VERIFY:]` flags, and "
