@@ -1,9 +1,12 @@
 """Slack event handler."""
 
+import fcntl
 import json
 import logging
 import subprocess
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
 import requests
@@ -48,19 +51,42 @@ def is_duplicate_event(event_id: str) -> bool:
     return False
 
 
-# Guru's Slack bot user ID -- confirmed live 2026-07-18 from a real decline message
-# in #product. Bot messages from any OTHER bot (including our own replies, which
-# would otherwise create a self-trigger loop) are still dropped below.
+# Guru's Slack identity -- confirmed live 2026-07-18 from real decline messages in
+# #product / #tmp_betterbrain. Guru edits carry identity under event["message"], so
+# we match on EITHER the user id or the bot_id. Messages from any OTHER bot
+# (including our own replies, which would otherwise self-trigger) are still dropped.
 GURU_BOT_USER_ID = "U028VSYP9CZ"
+GURU_BOT_ID = "B028AF2UNH4"
 
-# Both phrases must appear (case-insensitive) for a message to count as a Guru
-# decline. Matched against real Guru bot output, not guessed.
-GURU_DECLINE_PHRASES = ("don't have a verified answer", "look here instead")
+# A message counts as a Guru decline when its "go elsewhere" pointer is present.
+# Matched against 4 real decline variants (2026-07-18) whose hedge wording all
+# differed ("don't have a verified answer / corpus source / canonical list",
+# "not as a verified current ... capability") but which ALL ended with a
+# "Look here instead:" pointer -- the one marker unique to declines. A confident
+# Guru answer does not include it, so this is the reliable signal.
+GURU_DECLINE_PHRASES = ("look here instead",)
 
 
 def looks_like_guru_decline(text: str) -> bool:
-    lowered = (text or "").lower()
+    # Normalize curly apostrophes to straight so "don't" matches Guru's "don’t".
+    lowered = (text or "").lower().replace("’", "'").replace("‘", "'")
     return all(phrase in lowered for phrase in GURU_DECLINE_PHRASES)
+
+
+def _collect_block_text(node: Any) -> str:
+    """Recursively pull every string under a "text" key out of Slack blocks.
+    Guru's answer body lives in blocks, not the flat top-level text field."""
+    parts = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "text" and isinstance(value, str):
+                parts.append(value)
+            else:
+                parts.append(_collect_block_text(value))
+    elif isinstance(node, list):
+        for item in node:
+            parts.append(_collect_block_text(item))
+    return " ".join(p for p in parts if p)
 
 
 def normalize_event(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -68,28 +94,41 @@ def normalize_event(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     event = body.get("event", {})
     event_type = event.get("type")
 
-    # Bot messages are dropped UNLESS they're from an explicitly allow-listed bot
-    # (currently just Guru) -- this lets should_process_event() react to Guru's
-    # decline messages specifically, without opening the door to every bot in the
-    # workspace (including our own replies, which would otherwise self-trigger).
-    is_bot_message = bool(event.get("bot_id")) or event.get("subtype") == "bot_message"
-    if is_bot_message and event.get("user") != GURU_BOT_USER_ID:
+    # Guru streams answers by posting a placeholder ("Answer Generating...") then
+    # EDITING it with the final answer/decline. That edit arrives as a
+    # message_changed event whose real content lives under event["message"], so we
+    # unwrap edits and treat the nested message as the effective message.
+    is_edit = event.get("subtype") == "message_changed"
+    if event.get("subtype") == "message_deleted":
+        return None
+    msg = (event.get("message") or {}) if is_edit else event
+
+    msg_user = msg.get("user")
+    msg_bot_id = msg.get("bot_id")
+    is_bot_message = bool(msg_bot_id) or msg.get("subtype") == "bot_message" or msg_user == GURU_BOT_USER_ID
+
+    if is_bot_message:
+        # Only Guru gets through (match on user id OR bot_id). Every other bot,
+        # including our own replies, is dropped to avoid a self-trigger loop.
+        if msg_user != GURU_BOT_USER_ID and msg_bot_id != GURU_BOT_ID:
+            return None
+    elif is_edit:
+        # A human editing their own message -- nothing to react to.
         return None
 
-    # Ignore message edits/deletes if configured
-    if event.get("subtype") in ("message_changed", "message_deleted"):
-        return None
+    # Text lives in the flat field for humans, but in blocks for Guru's answers.
+    full_text = ((msg.get("text") or "") + " " + _collect_block_text(msg.get("blocks", []))).strip()
 
-    # Handle app_mention and message events
     if event_type in ("app_mention", "message"):
         return {
             "type": event_type,
             "channel": event.get("channel"),
-            "user": event.get("user"),
-            "text": event.get("text", ""),
-            "ts": event.get("ts"),
-            "thread_ts": event.get("thread_ts"),
+            "user": msg_user,
+            "text": full_text,
+            "ts": msg.get("ts") or event.get("ts"),
+            "thread_ts": msg.get("thread_ts"),
             "is_bot_message": is_bot_message,
+            "is_edit": is_edit,
         }
 
     return None
@@ -112,9 +151,15 @@ def should_process_event(event: Dict[str, Any], config: Config) -> bool:
     triggers = channel_config.triggers
 
     if event.get("is_bot_message"):
-        # normalize_event() already dropped every bot message except Guru's, so
-        # the only trigger a bot message can match is guruDecline.
-        return bool(triggers.get("guruDecline", False)) and looks_like_guru_decline(event.get("text", ""))
+        # normalize_event() already dropped every bot message except Guru's. This
+        # is only a STRUCTURAL gate -- is this Guru's substantial final answer in a
+        # guruDecline channel? (>250 chars skips the short "Answer Generating..."
+        # placeholder.) Whether that answer is actually a decline is judged by a
+        # model in process_guru_decline, because Guru's wording varies too much for
+        # reliable keyword matching.
+        if not triggers.get("guruDecline", False):
+            return False
+        return len((event.get("text") or "").strip()) > 250
 
     if event_type == "app_mention" and triggers.get("appMention", True):
         return True
@@ -173,8 +218,12 @@ def handle(event: Dict[str, Any], headers: Dict[str, str], body: str) -> Dict[st
         logger.info("Event ignored (bot message or unsupported type)")
         return {"statusCode": 200, "body": json.dumps({"ok": True})}
     
-    # Check for duplicate events
+    # Check for duplicate events. Guru's placeholder and its edits share one ts, so
+    # for edits we fold the text into the key -- each distinct edit content is
+    # evaluated once (until the full decline text arrives) without colliding.
     event_id = f"{normalized_event.get('channel')}_{normalized_event.get('ts')}"
+    if normalized_event.get("is_edit"):
+        event_id += f"_{hash(normalized_event.get('text', ''))}"
     if is_duplicate_event(event_id):
         logger.info(f"Skipping duplicate event: {event_id}")
         return {"statusCode": 200, "body": json.dumps({"ok": True})}
@@ -345,6 +394,92 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Optional[str]:
     return answer or None
 
 
+DECLINE_CLASSIFIER_PROMPT = (
+    "A support user asked a question and the Guru knowledge bot replied. Decide "
+    "whether Guru FULLY and confidently answered it, or whether it DECLINED / "
+    "hedged / said it could not verify / pointed the user elsewhere -- meaning a "
+    "human or a deeper search should step in. A cited but negative-or-uncertain "
+    "reply (\"I don't have a verified source\", \"not confirmed\", \"look here "
+    "instead\") counts as DECLINE. Reply with exactly one word: DECLINE or ANSWER."
+    "\n\nQUESTION:\n{question}\n\nGURU RESPONSE:\n{guru}"
+)
+
+
+def guru_response_is_decline(question: str, guru_text: str, betterbrain_config) -> bool:
+    """Ask a fast model whether Guru's reply is a decline/hedge (BetterBrain should
+    step in) or a confident answer (stay silent). Guru's phrasing varies too much
+    for reliable keyword matching. Falls back to the keyword matcher on any model
+    failure, so behavior never regresses below hard-decline detection."""
+    prompt = DECLINE_CLASSIFIER_PROMPT.format(
+        question=(question or "")[:1500], guru=(guru_text or "")[:4000]
+    )
+    cwd = str(betterbrain_config.repo_path) if betterbrain_config else None
+    try:
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--model", "haiku"],
+            cwd=cwd, capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("decline classifier timed out; falling back to keyword match")
+        return looks_like_guru_decline(guru_text)
+    except FileNotFoundError:
+        logger.error("`claude` CLI not found for decline classifier; keyword fallback")
+        return looks_like_guru_decline(guru_text)
+    if result.returncode != 0:
+        logger.warning(f"decline classifier exited {result.returncode}; keyword fallback")
+        return looks_like_guru_decline(guru_text)
+
+    verdict = (result.stdout or "").strip().upper()
+    tokens = verdict.split()
+    last = tokens[-1] if tokens else ""
+    if last == "DECLINE":
+        logger.info("decline classifier verdict: DECLINE")
+        return True
+    if last == "ANSWER":
+        logger.info("decline classifier verdict: ANSWER")
+        return False
+    logger.warning(f"decline classifier unclear verdict {verdict[:60]!r}; keyword fallback")
+    return looks_like_guru_decline(guru_text)
+
+
+def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_config) -> None:
+    """Append a Guru-declined question (+ BetterBrain's cascade result) to the corpus
+    gap log, so every miss becomes a durable, reviewable candidate for a PKR draft
+    (Step 5 of the /betterbrain-ask skill) instead of evaporating after the DM.
+
+    Best-effort and fcntl-locked: two concurrent cascades can append safely, and a
+    logging failure must never break the DM flow. This only ever *appends a review
+    candidate* -- it never writes a PKR or the claim ledger (that stays an
+    interactive, human-in-the-loop step by design)."""
+    if not betterbrain_config:
+        return
+    try:
+        gap_path = (
+            Path(str(betterbrain_config.repo_path))
+            / "knowledge-corpus" / "generated" / "betterbrain-ask-gaps.jsonl"
+        )
+        entry = {
+            "question": question,
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "escalated_to": [],  # bot can't see which live sources the cascade hit
+            "found_elsewhere": bool(answer),
+            "summary": (answer or "Cascade produced no answer.")[:1500],
+            "promoted_to_pkr": None,
+            "source": "guru-decline-slack-bot",
+            "channel": channel,
+        }
+        gap_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(gap_path, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(entry) + "\n")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        logger.info(f"Logged gap ({'answer' if answer else 'no-answer'}) for: {question[:80]}")
+    except Exception as e:
+        logger.warning(f"Failed to log gap: {e}")
+
+
 def process_guru_decline(event: Dict[str, Any], config: Config):
     """Handle a Guru decline: run the BetterBrain cascade and DM the result to a
     human reviewer. Deliberately does NOT reply in the original thread -- nothing
@@ -366,8 +501,20 @@ def process_guru_decline(event: Dict[str, Any], config: Config):
         logger.warning(f"Could not fetch parent question for {channel}/{parent_ts}")
         return
 
+    # Guru's reply reached us; let a model decide if it actually declined/hedged
+    # (BetterBrain steps in) or answered confidently (stay silent).
+    if not guru_response_is_decline(question, event.get("text", ""), config.betterbrain):
+        logger.info(f"Guru answered confidently in {channel}; staying silent (no cascade)")
+        return
+
     logger.info(f"Guru declined in {channel}; running BetterBrain cascade for: {question[:120]}")
     answer = run_betterbrain_cascade(question, config.betterbrain)
+
+    # Log the gap regardless of whether the cascade found an answer -- every Guru
+    # miss becomes a reviewable PKR-draft candidate (skill Step 4). Human still
+    # runs Step 5 interactively to promote any of these into an actual PKR.
+    log_gap(question, answer, channel, config.betterbrain)
+
     if not answer:
         logger.info("Cascade produced nothing to report; staying silent (not DMing a non-answer)")
         return
@@ -380,3 +527,4 @@ def process_guru_decline(event: Dict[str, Any], config: Config):
         f"_Not posted anywhere -- forward or reply yourself if it's worth sharing._"
     )
     responder.post_message(channel_config.notify_user_id, dm_text)
+    logger.info(f"DMed {channel_config.notify_user_id} with cascade result for: {question[:80]}")

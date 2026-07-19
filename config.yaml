@@ -119,10 +119,17 @@ channels:
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
+  # #tmp_betterbrain -- live guruDecline test channel, added 2026-07-18
+  C0B7VHX4Y73:
+    triggers:
+      appMention: false
+      questionLikeMessages: false
+      guruDecline: true
+    notifyUserId: U046SR718
 
 # v0 scope: BetterBrain's search+escalation runs headlessly (read-only), but
 # gap-logging and PKR-drafting stay a deliberate, interactive follow-up action --
 # see .claude/settings.json in the BetterBrain repo and SKILL.md's own notes.
 betterbrain:
-  repoPath: /Users/paulagustin/Documents/BetterBrain
-  cliTimeoutSeconds: 280
+  repoPath: /Users/pagustin/dev/betterbrain
+  cliTimeoutSeconds: 500
