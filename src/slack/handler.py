@@ -3,6 +3,7 @@
 import fcntl
 import json
 import logging
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -116,8 +117,16 @@ def normalize_event(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # A human editing their own message -- nothing to react to.
         return None
 
-    # Text lives in the flat field for humans, but in blocks for Guru's answers.
-    full_text = ((msg.get("text") or "") + " " + _collect_block_text(msg.get("blocks", []))).strip()
+    # Guru's answer body lives in blocks (its flat text is just a placeholder),
+    # but a normal human message carries the SAME content in both the flat text
+    # field and its blocks -- so naively concatenating doubles human messages.
+    # Only combine when each side adds something; otherwise take the longer one.
+    flat = (msg.get("text") or "").strip()
+    blocks = _collect_block_text(msg.get("blocks", [])).strip()
+    if blocks and flat and blocks not in flat and flat not in blocks:
+        full_text = (flat + " " + blocks).strip()
+    else:
+        full_text = blocks if len(blocks) > len(flat) else flat
 
     if event_type in ("app_mention", "message"):
         return {
@@ -162,6 +171,12 @@ def should_process_event(event: Dict[str, Any], config: Config) -> bool:
         return len((event.get("text") or "").strip()) > 250
 
     if event_type == "app_mention" and triggers.get("appMention", True):
+        return True
+
+    # An article command may arrive as a plain `message` (when only
+    # message.channels is subscribed, not app_mention) -- accept it either way as
+    # long as the channel has mentions enabled.
+    if triggers.get("appMention", False) and parse_article_command(event.get("text", "")):
         return True
 
     if event_type == "message" and triggers.get("questionLikeMessages", False):
@@ -237,10 +252,23 @@ def handle(event: Dict[str, Any], headers: Dict[str, str], body: str) -> Dict[st
     try:
         if normalized_event.get("is_bot_message"):
             process_guru_decline(normalized_event, config)
+        elif parse_article_command(normalized_event.get("text", "")):
+            process_article_request(normalized_event, config)
         else:
-            process_question(normalized_event, config)
+            ch_cfg = config.channels.get(normalized_event.get("channel"))
+            if ch_cfg and getattr(ch_cfg, "project", None):
+                process_question(normalized_event, config)
+            else:
+                # @mention in a non-Q&A channel with no project -- offer the one
+                # thing we can do here rather than erroring.
+                SlackResponder(config.slack.bot_token).post_message(
+                    normalized_event["channel"],
+                    "I can draft a support-article scaffold from the PKR corpus — try: "
+                    "`@BetterBrain draft article: <feature name>`",
+                    thread_ts=normalized_event.get("thread_ts") or normalized_event.get("ts"),
+                )
     except Exception as e:
-        logger.error(f"Failed to process question: {e}")
+        logger.error(f"Failed to process event: {e}")
         # Still return 200 to Slack to avoid retries
 
     return {"statusCode": 200, "body": json.dumps({"ok": True})}
@@ -478,6 +506,125 @@ def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_conf
         logger.info(f"Logged gap ({'answer' if answer else 'no-answer'}) for: {question[:80]}")
     except Exception as e:
         logger.warning(f"Failed to log gap: {e}")
+
+
+ARTICLE_CMD_RE = re.compile(
+    r"draft\s+(?:an?\s+)?article(?:\s+(?:on|for|about))?\s*:?\s*(.+)", re.IGNORECASE | re.DOTALL
+)
+
+
+def parse_article_command(text: str) -> Optional[Dict[str, str]]:
+    """Parse `@BetterBrain draft article: <topic>` (optionally with `integration`
+    or `area=Goals`). Returns None if the message isn't an article request."""
+    stripped = re.sub(r"<@[^>]+>", "", text or "").strip()
+    m = ARTICLE_CMD_RE.search(stripped)
+    if not m:
+        return None
+    topic = m.group(1).strip()
+    tmpl = "integration" if re.search(r"\bintegration\b", topic, re.IGNORECASE) else "feature"
+    area = ""
+    am = re.search(r"\barea[=:]\s*([A-Za-z]+)", topic)
+    if am:
+        area = am.group(1)
+        topic = re.sub(r"\barea[=:]\s*[A-Za-z]+", "", topic).strip()
+    topic = topic.strip(" .:-")
+    if not topic:
+        return None
+    return {"topic": topic, "tmpl": tmpl, "area": area}
+
+
+def process_article_request(event: Dict[str, Any], config: Config):
+    """Run draft_support_article.py against a support-requested topic and post the
+    generated SCAFFOLD + gap manifest back to the thread. Deterministic and
+    draft-only: it prepares an authoring scaffold from publishable PKRs (release-
+    gated), it does NOT write finished prose or publish anything customer-facing."""
+    channel = event["channel"]
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    responder = SlackResponder(config.slack.bot_token)
+
+    cmd = parse_article_command(event.get("text", ""))
+    if not cmd:
+        responder.post_message(
+            channel,
+            "Usage: `@BetterBrain draft article: <feature name>` "
+            "(add `integration` or `area=Goals` to refine).",
+            thread_ts=thread_ts,
+        )
+        return
+
+    bb = config.betterbrain
+    if not bb:
+        responder.post_message(channel, "BetterBrain repo isn't configured.", thread_ts=thread_ts)
+        return
+
+    py = str(Path(str(bb.repo_path)) / ".venv" / "bin" / "python3")
+    argv = [py, "scripts/draft_support_article.py", "--new", cmd["tmpl"], "--name", cmd["topic"],
+            "--rerank", "--rerank-model", "mistral-small3.2"]
+    if cmd["area"]:
+        argv += ["--area", cmd["area"]]
+
+    responder.post_message(
+        channel,
+        f"📝 Drafting a *{cmd['tmpl']}* scaffold for *{cmd['topic']}*"
+        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''} — matching + reranking the PKR corpus, ~40s…",
+        thread_ts=thread_ts,
+    )
+
+    try:
+        result = subprocess.run(
+            argv, cwd=str(bb.repo_path), capture_output=True, text=True, timeout=180
+        )
+    except subprocess.TimeoutExpired:
+        responder.post_message(channel, "❌ Article generator timed out.", thread_ts=thread_ts)
+        return
+    except FileNotFoundError:
+        responder.post_message(
+            channel, "❌ BetterBrain venv/python not found on this machine.", thread_ts=thread_ts
+        )
+        return
+
+    if result.returncode != 0:
+        logger.error(f"draft_support_article exited {result.returncode}: {result.stderr[:500]}")
+        responder.post_message(
+            channel, f"❌ Generator exited {result.returncode}:\n```{result.stderr[-600:]}```",
+            thread_ts=thread_ts,
+        )
+        return
+
+    m = re.search(r"^\s*([a-z0-9][a-z0-9-]+):\s+closed=", result.stdout, re.MULTILINE)
+    if not m:
+        responder.post_message(
+            channel, f"Generated, but couldn't locate the output:\n```{result.stdout[-600:]}```",
+            thread_ts=thread_ts,
+        )
+        return
+
+    slug = m.group(1)
+    summary = m.group(0).strip()
+    out_dir = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
+    scaffold_f = out_dir / f"{slug}.scaffold.md"
+    gaps_f = out_dir / f"{slug}.gaps.md"
+
+    responder.post_message(channel, f"✅ *Scaffold ready:* `{slug}`\n`{summary}`", thread_ts=thread_ts)
+    if gaps_f.exists():
+        responder.post_message(
+            channel, "*Gap manifest — what's covered vs. missing:*\n```"
+            + gaps_f.read_text()[:1800] + "```",
+            thread_ts=thread_ts,
+        )
+    if scaffold_f.exists():
+        responder.post_message(
+            channel, "*Scaffold — fill the [AUTHOR] stubs, then run `/author-article`:*\n```"
+            + scaffold_f.read_text()[:2600] + "```",
+            thread_ts=thread_ts,
+        )
+    responder.post_message(
+        channel,
+        "_Draft only — not published anywhere. Review, author the prose, and publish through the "
+        "normal flow. Full files on the mini at `knowledge-corpus/generated/article-drafts/`._",
+        thread_ts=thread_ts,
+    )
+    logger.info(f"Generated article scaffold '{slug}' for topic: {cmd['topic'][:80]}")
 
 
 def process_guru_decline(event: Dict[str, Any], config: Config):

@@ -119,10 +119,10 @@ channels:
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
-  # #tmp_betterbrain -- live guruDecline test channel, added 2026-07-18
+  # #tmp_betterbrain -- live guruDecline + article-scaffold test channel, 2026-07-18
   C0B7VHX4Y73:
     triggers:
-      appMention: false
+      appMention: true   # enables `@BetterBrain draft article: <topic>`
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
