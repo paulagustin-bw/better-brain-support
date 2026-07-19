@@ -116,8 +116,18 @@ def main():
     print("   In Slack, @mention BetterSupport and ask a question\n")
     print("="*60 + "\n")
     
-    # Run Flask app
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # Serve via waitress (production WSGI): no debug reloader (which caused stale
+    # code reloads) and no Werkzeug debugger (a remote code-exec surface on a
+    # tunnel-exposed endpoint). threads gives real concurrency for slow requests
+    # (the multi-minute /author-article pass). Falls back to a non-debug Flask
+    # server if waitress isn't installed.
+    try:
+        from waitress import serve
+        logger.info(f"Serving on 0.0.0.0:{port} via waitress (threads=8)")
+        serve(app, host='0.0.0.0', port=port, threads=8)
+    except ImportError:
+        logger.warning("waitress not installed; using Flask server with debug OFF")
+        app.run(host='0.0.0.0', port=port, debug=False)
 
 
 if __name__ == '__main__':
