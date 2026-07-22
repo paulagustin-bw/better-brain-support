@@ -506,7 +506,20 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Tuple[Optional
         "denied writes, gap logs, or drafts you were unable to save. That is "
         "operator bookkeeping and it is noise to the person who asked.\n"
         "If you have no confident answer, say so in one line and name the best next "
-        "step. A short honest decline is more useful than a long hedge.",
+        "step. A short honest decline is more useful than a long hedge.\n"
+        "\n"
+        "VERIFIER: if the answer is NOT already backed by a verified PKR, end with one "
+        "line @mentioning the owner for that product area and asking them to correct it:\n"
+        "  Calibration / Platform / Talent -> <@U031J16QHEV> (Kate Malcolm)\n"
+        "  Conversations / Feedback        -> <@U045DHXMGDT> (Neeraj Mohan)\n"
+        "  Goals                           -> <@U04KCTA594Y> (Varnika Garg)\n"
+        "  Reporting / Analytics           -> <@U051W375UJK> (Arnav Garg)\n"
+        "  Integrations / HRIS             -> <@U03MC6LERH9> (Rinku Ravi)\n"
+        "  Engage                          -> <@U066KKBKKBJ> (Sharan M)\n"
+        "Phrase it as e.g. '<@U03MC6LERH9> correct me if this is wrong.' Mention exactly "
+        "one person, and only for unverified answers -- pinging on every answer trains "
+        "people to mute the bot, which costs the correction this is meant to earn. If the "
+        "product area is unclear or unlisted, mention nobody.",
         cwd=str(betterbrain_config.repo_path),
         timeout=betterbrain_config.cli_timeout_seconds, label="cascade", with_status=True,
     )
