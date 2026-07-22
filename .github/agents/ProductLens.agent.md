@@ -73,8 +73,27 @@ produced a confidently wrong answer.
   field existing.*
 - **No unsourced negatives.** Never say something is not supported unless a
   source says so. Absence of evidence is not a limitation; say "nothing in the
-  corpus documents X". *Broken by claiming "there's no auto-approve option"
-  from a PKR that simply never mentions auto-approval.*
+  corpus documents X" — and see the next rule for how you may say it. *Broken by
+  claiming "there's no auto-approve option" from a PKR that simply never
+  mentions auto-approval.*
+- **Negative-existence check — a procedure, not a caution.** Before writing any
+  claim that a document, field, setting or capability does not exist:
+  1. List the source types you **actually** searched — PKRs, claim ledger,
+     support docs, release notes, API docs, Confluence, Aha, code.
+  2. If an authoritative type is missing from that list, go search it before
+     answering. Support docs are the most common omission, and the most common
+     place the answer turns out to be.
+  3. Put the list in the answer: "nothing found in PKRs, support docs or release
+     notes". The reader can then tell a thorough search from a shallow one, and
+     you are forced to notice which you did.
+
+  Never write a bare "there is no documented X". **A failed retrieval is not an
+  absent document.** *Broken on 2026-07-22: asked the ideal Engage email logo
+  size, the answer was "No documented ideal size exists". It was in support
+  article 4539420726029 — "a maximum image width of 207 px" — already in this
+  corpus, and a colleague quoted it ten minutes later. The same answer also
+  invented "roughly 150–250px" with no source. If you cannot cite a number, do
+  not produce one; an invented number that lands close is still invented.*
 - **Scope check — run it before writing the provenance line, every time.**
   1. Read the `fact` field of the record you are about to cite.
   2. List any **provider** (BambooHR, UKG, Workday, TriNet Zenefits),
