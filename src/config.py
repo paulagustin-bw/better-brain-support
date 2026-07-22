@@ -64,8 +64,17 @@ class ChannelConfig:
     mode: str = "auto"
     triggers: Dict[str, bool] = field(default_factory=dict)
     # Slack user ID to DM when the guruDecline trigger fires. Required for any
-    # channel with guruDecline enabled -- there is no auto-post path (by design).
+    # channel with guruDecline enabled: it is the fallback delivery target, and
+    # it always receives cascade failures regardless of cascade_reply.
     notify_user_id: Optional[str] = None
+    # Where a successful cascade answer goes.
+    #   "dm"     -- DM notify_user_id and post nothing publicly (default; the
+    #               reviewer forwards it by hand if it is worth sharing)
+    #   "thread" -- reply in the asker's own thread, so the answer reaches the
+    #               person who asked and the area SME can correct it in place
+    # Failures (timeout/error/empty) always DM and never post publicly: a bot
+    # announcing it has nothing, after Guru already declined, is just noise.
+    cascade_reply: str = "dm"
 
 
 @dataclass
@@ -176,6 +185,7 @@ def load_config(config_path: str = "config.yaml") -> Config:
             mode=chan_data.get("mode", "auto"),
             triggers=chan_data.get("triggers", {}),
             notify_user_id=chan_data.get("notifyUserId"),
+            cascade_reply=str(chan_data.get("cascadeReply", "dm")).lower(),
         )
 
     # Load BetterBrain config (only needed for channels using the guruDecline trigger)

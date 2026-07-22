@@ -8,7 +8,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, Tuple
 
 import requests
 
@@ -390,29 +390,38 @@ def fetch_parent_message_text(bot_token: str, channel: str, parent_ts: str) -> O
 
 
 def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[list] = None,
-                label: str = "claude") -> Optional[str]:
+                label: str = "claude", with_status: bool = False):
     """Run `claude -p` with --output-format json so every subscription-billed call
     logs its token usage + cost (these all draw on the Claude Max plan, so we want
     visibility as the team hammers the POC). Returns the result text, or None on
     timeout / missing CLI / non-zero exit / unparseable output (callers treat None
-    as failure and fall back)."""
+    as failure and fall back).
+
+    With ``with_status=True`` returns a ``(text, status)`` tuple instead, where
+    status is one of ``ok`` / ``empty`` / ``timeout`` / ``not_found`` / ``error``
+    -- so a caller can tell a timeout apart from a genuine empty result. The
+    default (no status) keeps the plain ``Optional[str]`` contract other callers
+    rely on."""
+    def _ret(text: Optional[str], status: str):
+        return (text, status) if with_status else text
+
     argv = ["claude", "-p", prompt, "--output-format", "json"] + (extra_args or [])
     try:
         result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         logger.error(f"claude -p timed out ({label})")
-        return None
+        return _ret(None, "timeout")
     except FileNotFoundError:
         logger.error("`claude` CLI not found on PATH -- is Claude Code installed on this machine?")
-        return None
+        return _ret(None, "not_found")
     if result.returncode != 0:
         logger.error(f"claude -p exited {result.returncode} ({label}): {result.stderr[:400]}")
-        return None
+        return _ret(None, "error")
     try:
         data = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
         logger.warning(f"claude -p output not JSON ({label}); treating as failure")
-        return None
+        return _ret(None, "error")
     usage = data.get("usage") or {}
     logger.info(
         f"[usage] {label}: in={usage.get('input_tokens')} out={usage.get('output_tokens')} "
@@ -421,12 +430,17 @@ def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[lis
     )
     if data.get("is_error"):
         logger.error(f"claude -p returned is_error ({label}): {str(data.get('result'))[:300]}")
-        return None
-    return data.get("result")
+        return _ret(None, "error")
+    text = data.get("result")
+    return _ret(text, "ok" if text else "empty")
 
 
-def run_betterbrain_cascade(question: str, betterbrain_config) -> Optional[str]:
+def run_betterbrain_cascade(question: str, betterbrain_config) -> Tuple[Optional[str], str]:
     """Run the /betterbrain-ask skill headlessly against the given question.
+
+    Returns ``(answer, status)`` -- answer is the cascade result (or None), and
+    status is ``ok`` / ``empty`` / ``timeout`` / ``not_found`` / ``error`` so the
+    caller can DM a timeout differently from a genuine dry run.
 
     This is a read-only invocation by design (see .claude/settings.json in the
     BetterBrain repo): search + escalation across BetterBrain/Confluence/Aha/
@@ -437,12 +451,12 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Optional[str]:
     """
     if not betterbrain_config:
         logger.error("No betterbrain config set -- cannot run cascade")
-        return None
-    answer = _run_claude(
+        return None, "error"
+    answer, status = _run_claude(
         f"/betterbrain-ask {question}", cwd=str(betterbrain_config.repo_path),
-        timeout=betterbrain_config.cli_timeout_seconds, label="cascade",
+        timeout=betterbrain_config.cli_timeout_seconds, label="cascade", with_status=True,
     )
-    return (answer or "").strip() or None
+    return ((answer or "").strip() or None), status
 
 
 DECLINE_CLASSIFIER_PROMPT = (
@@ -483,7 +497,8 @@ def guru_response_is_decline(question: str, guru_text: str, betterbrain_config) 
     return looks_like_guru_decline(guru_text)
 
 
-def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_config) -> None:
+def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_config,
+            status: str = "ok") -> None:
     """Append a Guru-declined question (+ BetterBrain's cascade result) to the corpus
     gap log, so every miss becomes a durable, reviewable candidate for a PKR draft
     (Step 5 of the /betterbrain-ask skill) instead of evaporating after the DM.
@@ -499,12 +514,21 @@ def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_conf
             Path(str(betterbrain_config.repo_path))
             / "knowledge-corpus" / "generated" / "betterbrain-ask-gaps.jsonl"
         )
+        if answer:
+            summary = answer[:1500]
+        elif status == "timeout":
+            summary = "Cascade timed out before finishing -- no answer captured."
+        elif status in ("error", "not_found"):
+            summary = f"Cascade failed to run ({status}) -- no answer captured."
+        else:
+            summary = "Cascade produced no answer."
         entry = {
             "question": question,
             "date": datetime.now().strftime("%Y-%m-%d"),
             "escalated_to": [],  # bot can't see which live sources the cascade hit
             "found_elsewhere": bool(answer),
-            "summary": (answer or "Cascade produced no answer.")[:1500],
+            "summary": summary,
+            "cascade_status": status,
             "promoted_to_pkr": None,
             "source": "guru-decline-slack-bot",
             "channel": channel,
@@ -516,7 +540,7 @@ def log_gap(question: str, answer: Optional[str], channel: str, betterbrain_conf
                 f.write(json.dumps(entry) + "\n")
             finally:
                 fcntl.flock(f, fcntl.LOCK_UN)
-        logger.info(f"Logged gap ({'answer' if answer else 'no-answer'}) for: {question[:80]}")
+        logger.info(f"Logged gap (status={status}) for: {question[:80]}")
     except Exception as e:
         logger.warning(f"Failed to log gap: {e}")
 
@@ -793,21 +817,69 @@ def process_guru_decline(event: Dict[str, Any], config: Config):
         return
 
     logger.info(f"Guru declined in {channel}; running BetterBrain cascade for: {question[:120]}")
-    answer = run_betterbrain_cascade(question, config.betterbrain)
+    answer, status = run_betterbrain_cascade(question, config.betterbrain)
 
     # Log the gap regardless of whether the cascade found an answer -- every Guru
     # miss becomes a reviewable PKR-draft candidate (skill Step 4). Human still
     # runs Step 5 interactively to promote any of these into an actual PKR.
-    log_gap(question, answer, channel, config.betterbrain)
-
-    if not answer:
-        logger.info("Cascade produced nothing to report; staying silent (not DMing a non-answer)")
-        return
+    log_gap(question, answer, channel, config.betterbrain, status=status)
 
     responder = SlackResponder(config.slack.bot_token)
+    orig_link = (
+        f"<https://betterworks.slack.com/archives/{channel}/"
+        f"p{parent_ts.replace('.', '')}|Original question>"
+    )
+
+    if not answer:
+        # No answer to forward, but don't stay silent -- a miss the reviewer never
+        # hears about is a miss twice (this is exactly how the 2026-07-20 UKG-sync
+        # timeout went unnoticed). Send a short heads-up so timeouts and dry runs
+        # are visible; the full entry is already in betterbrain-ask-gaps.jsonl.
+        if status == "timeout":
+            note = (
+                f"⏳ *Guru declined and my BetterBrain cascade timed out before finishing.*\n"
+                f"{orig_link}\n\n"
+                f"No answer captured -- logged as a gap. Worth a manual look or a re-run "
+                f"(the cascade may just need more time than the current limit)."
+            )
+        elif status in ("error", "not_found"):
+            note = (
+                f":warning: *Guru declined, but my BetterBrain cascade failed to run "
+                f"({status}).*\n{orig_link}\n\nLogged as a gap; the bot may need attention."
+            )
+        else:
+            note = (
+                f"🧠 *Guru declined; I ran BetterBrain's cascade but it came up empty.*\n"
+                f"{orig_link}\n\n"
+                f"No corpus/escalation answer found -- logged as a gap for review."
+            )
+        responder.post_message(channel_config.notify_user_id, note)
+        logger.info(
+            f"DMed {channel_config.notify_user_id} a no-answer heads-up "
+            f"(status={status}) for: {question[:80]}"
+        )
+        return
+
+    if channel_config.cascade_reply == "thread":
+        # Answer the person who actually asked, in their own thread. This is the
+        # point of the whole system: the asker gets unblocked without a human
+        # relay, and the area SME -- who is already in this channel and already
+        # reading this thread -- can correct it in place. A DM to a reviewer
+        # cannot produce either of those.
+        responder.post_message(channel, answer, thread_ts=parent_ts)
+        logger.info(
+            f"Posted cascade answer in-thread to {channel}/{parent_ts} for: {question[:80]}"
+        )
+        # Keep the reviewer informed without making them the delivery path.
+        responder.post_message(
+            channel_config.notify_user_id,
+            f"🧠 *Posted a BetterBrain cascade answer in-thread.*\n{orig_link}\n\n{answer}",
+        )
+        return
+
     dm_text = (
         f"🧠 *Guru couldn't answer this one, so I ran BetterBrain's cascade:*\n"
-        f"<https://betterworks.slack.com/archives/{channel}/p{parent_ts.replace('.', '')}|Original question>\n\n"
+        f"{orig_link}\n\n"
         f"{answer}\n\n"
         f"_Not posted anywhere -- forward or reply yourself if it's worth sharing._"
     )
