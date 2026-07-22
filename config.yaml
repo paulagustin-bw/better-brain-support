@@ -94,33 +94,81 @@ channels:
   # codebase-search path -- see process_guru_decline() in src/slack/handler.py.
   C033TEH2T:
     triggers:
-      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
-                         # process_mention_question) but always answers in-thread,
-                         # i.e. publicly. Re-enable once cascade answer quality is
-                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
-                         # excellent answer and one confidently wrong one.
+      appMention: false  # OFF by decision, 2026-07-22 -- not pending anything.
+                         # The @mention path works (handler.py
+                         # process_mention_question) but always answers
+                         # in-thread, i.e. PUBLICLY, which is the whole risk.
+                         #
+                         # The evaluation this used to wait on has happened. The
+                         # cascade now carries five hard rules verified by replay,
+                         # per-claim provenance binding, and a provenance gate on
+                         # the result. It is substantially better than 2026-07-21.
+                         #
+                         # Still off because "much better" is not "safe to post
+                         # publicly unattended". On 2026-07-22, after all of that
+                         # landed, it answered an Engage logo question by citing a
+                         # product_area Admin record as Verified under an invented
+                         # product name, with correct-looking specs and sound
+                         # arithmetic. Only the product identity was fake. See
+                         # claude_findings/2026-07-22-008 in the corpus repo.
+                         #
+                         # guruDecline stays on because those answers DM Paul
+                         # (notifyUserId) and a human reads them before anyone
+                         # else does. That asymmetry is the point.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718  # Paul Agustin -- confirmed directly, 2026-07-18. DM only, never posts to the channel.
   # #engage_product
   CU207A35G:
     triggers:
-      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
-                         # process_mention_question) but always answers in-thread,
-                         # i.e. publicly. Re-enable once cascade answer quality is
-                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
-                         # excellent answer and one confidently wrong one.
+      appMention: false  # OFF by decision, 2026-07-22 -- not pending anything.
+                         # The @mention path works (handler.py
+                         # process_mention_question) but always answers
+                         # in-thread, i.e. PUBLICLY, which is the whole risk.
+                         #
+                         # The evaluation this used to wait on has happened. The
+                         # cascade now carries five hard rules verified by replay,
+                         # per-claim provenance binding, and a provenance gate on
+                         # the result. It is substantially better than 2026-07-21.
+                         #
+                         # Still off because "much better" is not "safe to post
+                         # publicly unattended". On 2026-07-22, after all of that
+                         # landed, it answered an Engage logo question by citing a
+                         # product_area Admin record as Verified under an invented
+                         # product name, with correct-looking specs and sound
+                         # arithmetic. Only the product identity was fake. See
+                         # claude_findings/2026-07-22-008 in the corpus repo.
+                         #
+                         # guruDecline stays on because those answers DM Paul
+                         # (notifyUserId) and a human reads them before anyone
+                         # else does. That asymmetry is the point.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
   # #support
   C0JFS90JE:
     triggers:
-      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
-                         # process_mention_question) but always answers in-thread,
-                         # i.e. publicly. Re-enable once cascade answer quality is
-                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
-                         # excellent answer and one confidently wrong one.
+      appMention: false  # OFF by decision, 2026-07-22 -- not pending anything.
+                         # The @mention path works (handler.py
+                         # process_mention_question) but always answers
+                         # in-thread, i.e. PUBLICLY, which is the whole risk.
+                         #
+                         # The evaluation this used to wait on has happened. The
+                         # cascade now carries five hard rules verified by replay,
+                         # per-claim provenance binding, and a provenance gate on
+                         # the result. It is substantially better than 2026-07-21.
+                         #
+                         # Still off because "much better" is not "safe to post
+                         # publicly unattended". On 2026-07-22, after all of that
+                         # landed, it answered an Engage logo question by citing a
+                         # product_area Admin record as Verified under an invented
+                         # product name, with correct-looking specs and sound
+                         # arithmetic. Only the product identity was fake. See
+                         # claude_findings/2026-07-22-008 in the corpus repo.
+                         #
+                         # guruDecline stays on because those answers DM Paul
+                         # (notifyUserId) and a human reads them before anyone
+                         # else does. That asymmetry is the point.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
