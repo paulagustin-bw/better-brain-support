@@ -94,21 +94,33 @@ channels:
   # codebase-search path -- see process_guru_decline() in src/slack/handler.py.
   C033TEH2T:
     triggers:
-      appMention: false
+      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
+                         # process_mention_question) but always answers in-thread,
+                         # i.e. publicly. Re-enable once cascade answer quality is
+                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
+                         # excellent answer and one confidently wrong one.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718  # Paul Agustin -- confirmed directly, 2026-07-18. DM only, never posts to the channel.
   # #engage_product
   CU207A35G:
     triggers:
-      appMention: false
+      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
+                         # process_mention_question) but always answers in-thread,
+                         # i.e. publicly. Re-enable once cascade answer quality is
+                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
+                         # excellent answer and one confidently wrong one.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
   # #support
   C0JFS90JE:
     triggers:
-      appMention: false
+      appMention: false  # OFF pending evaluation. The @mention path works (handler.py
+                         # process_mention_question) but always answers in-thread,
+                         # i.e. publicly. Re-enable once cascade answer quality is
+                         # characterised in #tmp_betterbrain -- 2026-07-21 saw one
+                         # excellent answer and one confidently wrong one.
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
@@ -126,10 +138,19 @@ channels:
       questionLikeMessages: false
       guruDecline: true
     notifyUserId: U046SR718
+    # Answers post in the asker's thread here instead of only DMing the reviewer.
+    # Enabled on the test channel first: this is the first public-posting path,
+    # and the tightened ProductLens output contract has not been observed in the
+    # wild yet. Add the same line to #product / #support / #engage_product once
+    # the format holds up.
+    cascadeReply: thread
 
 # v0 scope: BetterBrain's search+escalation runs headlessly (read-only), but
 # gap-logging and PKR-drafting stay a deliberate, interactive follow-up action --
 # see .claude/settings.json in the BetterBrain repo and SKILL.md's own notes.
 betterbrain:
   repoPath: /Users/pagustin/dev/betterbrain
-  cliTimeoutSeconds: 500
+  # 900s (15 min): the 500s default killed the 2026-07-20 #product UKG-sync
+  # cascade mid-run (it needs the full Confluence/Aha/GitHub escalation when the
+  # corpus has nothing). Bump if timeouts recur; timeouts now DM a heads-up.
+  cliTimeoutSeconds: 900
