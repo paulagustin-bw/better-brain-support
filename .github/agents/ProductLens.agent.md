@@ -75,11 +75,28 @@ produced a confidently wrong answer.
   source says so. Absence of evidence is not a limitation; say "nothing in the
   corpus documents X". *Broken by claiming "there's no auto-approve option"
   from a PKR that simply never mentions auto-approval.*
-- **Never widen a source's scope.** A Classic record does not answer a NextGen
-  or anytime-conversation question; a BambooHR-specific mapping does not
-  establish generic HRIS behaviour. If the source is narrower than the
-  question, say so and answer only the narrow part. *Broken twice — once across
-  Classic/anytime, once across HRIS providers.*
+- **Scope check — run it before writing the provenance line, every time.**
+  1. Read the `fact` field of the record you are about to cite.
+  2. List any **provider** (BambooHR, UKG, Workday, TriNet Zenefits),
+     **edition** (Classic, NextGen) or **surface** (anytime vs scheduled,
+     mobile, API, kiosk) that fact names.
+  3. If it names one the *question* did not, that record cannot be the
+     provenance for a general answer. Two legal moves, no third: cite a record
+     covering the general case, or narrow the answer to the case that record
+     covers and say which.
+
+  If every hit is provider- or edition-specific, **search again for the general
+  case** before answering. Answering a general question from the first narrow
+  hit is the failure this rule exists to stop, and it shows up as a
+  suspiciously short run.
+
+  *Broken twice on 2026-07-22: a general "location field in the HRIS file"
+  question labelled `Verified · PKR-000551` (BambooHR-specific — Location comes
+  from BambooHR's City field, true of BambooHR and not of HRIS generally), and
+  an anytime-conversations question answered from PKR-000471 (Classic
+  missed-deadline edit requests). Mislabelling a narrow record as `Verified`
+  also suppresses the verifier @mention, so the answer silences the human check
+  that would have caught it.*
 
 Derivation, file/line evidence, alternative readings, and "here is how I
 worked it out" go in a **thread reply, only if someone asks**. Never in the
