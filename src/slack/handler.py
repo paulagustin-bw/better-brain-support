@@ -463,8 +463,68 @@ def _record_usage(label: str, argv: list, data: dict, usage: dict) -> None:
         logger.warning(f"could not record usage row ({label}): {exc}")
 
 
+# A valid cascade answer always carries exactly one provenance line (output
+# contract rule 2). Bookkeeping chatter never does, which makes this the one
+# reliable way to tell an answer from a note without parsing prose.
+PROVENANCE_MARKERS = (
+    "Verified ·",
+    "Verified -",
+    "Not yet in BetterBrain",
+    "Unconfirmed",
+    "Not in BetterBrain",
+)
+
+
+def _has_provenance(text: Optional[str]) -> bool:
+    return bool(text) and any(marker in text for marker in PROVENANCE_MARKERS)
+
+
+def _recover_answer_from_transcript(session_id: str, cwd: str) -> Optional[str]:
+    """Pull the real answer out of the session transcript when `result` is not it.
+
+    `claude -p --output-format json` returns only the FINAL assistant text block
+    as `result`. The /betterbrain-ask skill's later steps sometimes emit a
+    gap-log note as a separate trailing turn, and that note then replaces the
+    answer -- on 2026-07-22 a correctly sourced, correctly scoped reply was
+    reduced to "Gap logged for corpus review". The earlier blocks exist only in
+    the transcript, so recover from there.
+
+    Best-effort by design: this depends on Claude Code's on-disk transcript
+    layout, which is not a stable interface. Any failure returns None and the
+    caller falls back to rejecting the run, which is the safe direction.
+    """
+    try:
+        slug = cwd.replace("/", "-")
+        path = Path.home() / ".claude" / "projects" / slug / f"{session_id}.jsonl"
+        if not path.exists():
+            return None
+        answers = []
+        with path.open() as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "assistant":
+                    continue
+                content = (record.get("message") or {}).get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    text = (block.get("text") or "").strip()
+                    if _has_provenance(text):
+                        answers.append(text)
+        return answers[-1] if answers else None
+    except Exception as exc:  # transcript layout changed, permissions, etc.
+        logger.warning(f"transcript recovery failed: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[list] = None,
-                label: str = "claude", with_status: bool = False):
+                label: str = "claude", with_status: bool = False,
+                require_provenance: bool = False):
     """Run `claude -p` with --output-format json so every subscription-billed call
     logs its token usage + cost (these all draw on the Claude Max plan, so we want
     visibility as the team hammers the POC). Returns the result text, or None on
@@ -507,6 +567,23 @@ def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[lis
         logger.error(f"claude -p returned is_error ({label}): {str(data.get('result'))[:300]}")
         return _ret(None, "error")
     text = data.get("result")
+
+    if require_provenance and text and not _has_provenance(text):
+        # `result` is the last assistant block, which is not always the answer.
+        logger.warning(
+            f"claude -p result has no provenance line ({label}); "
+            f"looks like trailing bookkeeping: {text[:120]!r}"
+        )
+        recovered = _recover_answer_from_transcript(data.get("session_id") or "", cwd)
+        if recovered:
+            logger.info(f"recovered answer from transcript ({label}), {len(recovered)} chars")
+            return _ret(recovered, "ok")
+        # Posting the bookkeeping note is worse than posting nothing: it reads as
+        # the bot answering with nonsense, and it buries the fact that a real
+        # answer was produced and lost.
+        logger.error(f"no recoverable answer ({label}); refusing to post bookkeeping text")
+        return _ret(None, "empty")
+
     return _ret(text, "ok" if text else "empty")
 
 
@@ -678,6 +755,9 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Tuple[Optional
         "product area is unclear or unlisted, mention nobody.",
         cwd=str(betterbrain_config.repo_path),
         timeout=betterbrain_config.cli_timeout_seconds, label="cascade", with_status=True,
+        # Only the cascade has a provenance contract to check against; the
+        # decline classifier and article author legitimately return bare text.
+        require_provenance=True,
         # Sonnet, not the default. The cascade searches, reads and synthesises with
         # citations -- work this tier handles well -- and 18 runs on the default
         # model cost $31.51 ($1.75 each), which does not scale to three channels.
