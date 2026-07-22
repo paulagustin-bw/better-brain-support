@@ -2,11 +2,12 @@
 
 import fcntl
 import json
+import os
 import logging
 import re
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, Set, Tuple
 
@@ -421,6 +422,47 @@ def fetch_parent_message_text(bot_token: str, channel: str, parent_ts: str) -> O
     return messages[0].get("text") or None
 
 
+USAGE_LOG = Path(
+    os.getenv("BETTERBRAIN_USAGE_LOG")
+    or Path.home() / "Library" / "Logs" / "BetterBrainSupport" / "usage.jsonl"
+)
+
+
+def _record_usage(label: str, argv: list, data: dict, usage: dict) -> None:
+    """Append one structured usage row per `claude -p` call.
+
+    The same numbers already go to the text log, but only as prose -- fine for
+    tailing, useless for "what did this cost us last month and what did we get
+    for it". One JSON object per line is aggregable, and recording the model
+    means a cheaper-model experiment can be evaluated against the runs it
+    replaced rather than against a vague memory of what things used to cost.
+
+    Never let bookkeeping break an answer: any failure here is logged and
+    swallowed.
+    """
+    try:
+        model = "default"
+        if "--model" in argv:
+            model = argv[argv.index("--model") + 1]
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "label": label,
+            "model": model,
+            "cost_usd": data.get("total_cost_usd"),
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+            "turns": data.get("num_turns"),
+            "duration_ms": data.get("duration_ms"),
+            "is_error": bool(data.get("is_error")),
+        }
+        USAGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with USAGE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+    except Exception as exc:  # pragma: no cover - telemetry must never break a reply
+        logger.warning(f"could not record usage row ({label}): {exc}")
+
+
 def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[list] = None,
                 label: str = "claude", with_status: bool = False):
     """Run `claude -p` with --output-format json so every subscription-billed call
@@ -460,6 +502,7 @@ def _run_claude(prompt: str, *, cwd: str, timeout: int, extra_args: Optional[lis
         f"cache_read={usage.get('cache_read_input_tokens')} cost=${data.get('total_cost_usd')} "
         f"turns={data.get('num_turns')} {data.get('duration_ms')}ms (Max subscription)"
     )
+    _record_usage(label, argv, data, usage)
     if data.get("is_error"):
         logger.error(f"claude -p returned is_error ({label}): {str(data.get('result'))[:300]}")
         return _ret(None, "error")
@@ -528,6 +571,17 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Tuple[Optional
         "product area is unclear or unlisted, mention nobody.",
         cwd=str(betterbrain_config.repo_path),
         timeout=betterbrain_config.cli_timeout_seconds, label="cascade", with_status=True,
+        # Sonnet, not the default. The cascade searches, reads and synthesises with
+        # citations -- work this tier handles well -- and 18 runs on the default
+        # model cost $31.51 ($1.75 each), which does not scale to three channels.
+        #
+        # Model tier was not the quality lever here: the 2026-07-21 Workday answer
+        # was wrong on the *default* model, and the fix was the precedence rule that
+        # makes it check code before trusting a doc. The output contract, provenance
+        # line and verifier mention do the quality work; the model does the reading.
+        #
+        # Override with BETTERBRAIN_CASCADE_MODEL to A/B against the usage log.
+        extra_args=["--model", os.getenv("BETTERBRAIN_CASCADE_MODEL", "sonnet")],
     )
     return ((answer or "").strip() or None), status
 
