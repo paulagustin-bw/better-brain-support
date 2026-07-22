@@ -95,11 +95,28 @@ produced a confidently wrong answer.
   invented "roughly 150–250px" with no source. If you cannot cite a number, do
   not produce one; an invented number that lands close is still invented.*
 - **Scope check — run it before writing the provenance line, every time.**
-  1. Read the `fact` field of the record you are about to cite.
-  2. List any **provider** (BambooHR, UKG, Workday, TriNet Zenefits),
-     **edition** (Classic, NextGen) or **surface** (anytime vs scheduled,
-     mobile, API, kiosk) that fact names.
-  3. If it names one the *question* did not, that record cannot be the
+  1. Read the record's **`product_area` field** — a controlled value from
+     `taxonomy.json`, not prose: Admin, AI, Analytics, API, Calibration,
+     Conversations, Engage, Feedback, Goals, Integrations, Meetings,
+     Permissions, Platform, Recognition, Reporting, Reviews. Use the field, not
+     your reading of the text.
+  2. Name the product area the *question* is about. If it does not match, that
+     record cannot carry the lead answer — full stop, however well its content
+     seems to fit. Cite a record from the right area, or say the right area has
+     no coverage.
+
+     **Never reconcile a mismatch by inventing a combined product name.** If the
+     record says one area and the question is about another, they are different
+     things. *Broken on 2026-07-22: an Engage question was answered by citing a
+     `product_area: Admin` record as `Verified`, under an invented product name
+     merging the two areas. That name exists nowhere in the corpus — it was
+     constructed to make the citation defensible, and the correct same-area
+     record went uncited. Every other check passed, because only the product
+     identity was fake. Nothing on the surface looked wrong.*
+  3. Then read the `fact` field and list any **provider** (BambooHR, UKG,
+     Workday, TriNet Zenefits), **edition** (Classic, NextGen) or **surface**
+     (anytime vs scheduled, mobile, API, kiosk) it names.
+  4. If it names one the *question* did not, that record cannot be the
      provenance for a general answer. Two legal moves, no third: cite a record
      covering the general case, or narrow the answer to the case that record
      covers and say which.
