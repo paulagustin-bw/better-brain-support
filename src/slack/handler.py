@@ -57,6 +57,12 @@ def is_duplicate_event(event_id: str) -> bool:
 # we match on EITHER the user id or the bot_id. Messages from any OTHER bot
 # (including our own replies, which would otherwise self-trigger) are still dropped.
 GURU_BOT_USER_ID = "U028VSYP9CZ"
+# This bot's own Slack user id (auth.test -> user_id, betterbrain_aha_doc_r).
+# Needed because an @mention only arrives as an `app_mention` event if the Slack
+# app subscribes to that event type; with only `message.channels` subscribed the
+# same ping arrives as a plain `message` whose text contains this id. Matching on
+# it lets a direct mention work under either subscription.
+SELF_BOT_USER_ID = "U0BCJ3LSCG5"
 GURU_BOT_ID = "B028AF2UNH4"
 
 # A message counts as a Guru decline when its "go elsewhere" pointer is present.
@@ -173,6 +179,17 @@ def should_process_event(event: Dict[str, Any], config: Config) -> bool:
     if event_type == "app_mention" and triggers.get("appMention", True):
         return True
 
+    # Same ping, different subscription. If the Slack app is only subscribed to
+    # message.channels, an @mention never arrives as `app_mention` -- it comes
+    # through as a `message` carrying our user id in its text. Without this, an
+    # @mention in a channel with appMention enabled is silently ignored.
+    if (
+        event_type == "message"
+        and triggers.get("appMention", False)
+        and f"<@{SELF_BOT_USER_ID}>" in (event.get("text") or "")
+    ):
+        return True
+
     # An article/author command may arrive as a plain `message` (when only
     # message.channels is subscribed, not app_mention) -- accept it either way as
     # long as the channel has mentions enabled.
@@ -247,7 +264,11 @@ def handle(event: Dict[str, Any], headers: Dict[str, str], body: str) -> Dict[st
     
     # Check if we should process this event
     if not should_process_event(normalized_event, config):
-        logger.info("Event ignored (channel not configured or triggers not met)")
+        logger.info(
+            "Event ignored (channel not configured or triggers not met): "
+            f"type={normalized_event.get('type')} channel={normalized_event.get('channel')} "
+            f"bot={normalized_event.get('is_bot_message')} len={len(normalized_event.get('text') or '')}"
+        )
         return {"statusCode": 200, "body": json.dumps({"ok": True})}
     
     # Process event asynchronously (in production, this would be queued)
@@ -463,8 +484,30 @@ def run_betterbrain_cascade(question: str, betterbrain_config) -> Tuple[Optional
     if not betterbrain_config:
         logger.error("No betterbrain config set -- cannot run cascade")
         return None, "error"
+    # The skill's own output guidance is written for an interactive operator, who
+    # wants the full derivation. This answer goes into a busy Slack channel where
+    # a wall of text reads as less confident, not more -- and where nobody wants
+    # the bot's internal bookkeeping. Constrain the shape at the call site so the
+    # skill stays verbose where verbosity is useful.
     answer, status = _run_claude(
-        f"/betterbrain-ask {question}", cwd=str(betterbrain_config.repo_path),
+        f"/betterbrain-ask {question}\n\n"
+        "OUTPUT CONTRACT — this answer is posted directly into a Slack thread for "
+        "non-technical colleagues, so it must be short:\n"
+        "1. Lead with the answer in ONE sentence. No preamble, no restating the question.\n"
+        "2. Then ONE line of provenance: `Verified · PKR-XXXXXX`, or "
+        "`Not verified — from <source>`, or `Not in BetterBrain`.\n"
+        "3. Then AT MOST three short bullets, only for detail that changes what the "
+        "reader does next (e.g. a caveat that limits when the answer holds).\n"
+        "4. Stop. Target ~700 characters.\n"
+        "Put derivation, file/line evidence, per-source breakdowns and alternate "
+        "readings NOWHERE in this answer -- they belong in a follow-up if asked.\n"
+        "Never narrate your own process or environment: no step numbers, no "
+        "'I searched X then Y', and above all nothing about tool permissions, "
+        "denied writes, gap logs, or drafts you were unable to save. That is "
+        "operator bookkeeping and it is noise to the person who asked.\n"
+        "If you have no confident answer, say so in one line and name the best next "
+        "step. A short honest decline is more useful than a long hedge.",
+        cwd=str(betterbrain_config.repo_path),
         timeout=betterbrain_config.cli_timeout_seconds, label="cascade", with_status=True,
     )
     return ((answer or "").strip() or None), status
