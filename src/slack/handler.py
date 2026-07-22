@@ -262,6 +262,17 @@ def handle(event: Dict[str, Any], headers: Dict[str, str], body: str) -> Dict[st
             ch_cfg = config.channels.get(normalized_event.get("channel"))
             if ch_cfg and getattr(ch_cfg, "project", None):
                 process_question(normalized_event, config)
+            elif ch_cfg and ch_cfg.triggers.get("guruDecline") and config.betterbrain:
+                # A direct @mention in a product-knowledge channel. These channels
+                # have no `project`, so the codebase-search path above cannot serve
+                # them -- but the BetterBrain cascade can, and a product question is
+                # what someone @mentioning the bot in #product actually wants.
+                #
+                # This is also the trigger that does not depend on Guru. The
+                # guruDecline path only fires when Guru posts a decline, so without
+                # this branch BetterBrain would go completely silent in these
+                # channels the moment Guru is removed.
+                process_mention_question(normalized_event, config)
             else:
                 # @mention in a non-Q&A channel with no project -- offer the one
                 # thing we can do here rather than erroring.
@@ -781,6 +792,52 @@ def process_author_request(event: Dict[str, Any], config: Config):
         channel, f"✍️ Re-authoring `{slug}` from its scaffold — ~3-10 min…", thread_ts=thread_ts,
     )
     _author_and_deliver(responder, channel, thread_ts, bb, slug)
+
+
+def process_mention_question(event: Dict[str, Any], config: Config):
+    """Answer a direct @mention in a product-knowledge channel via the cascade.
+
+    Unlike process_guru_decline, this does not wait for Guru to fail: somebody
+    asked BetterBrain directly, so it answers directly. That makes it the only
+    trigger in these channels that survives Guru being removed.
+
+    Because the mention is an explicit request, the answer always goes to the
+    thread the person asked in, regardless of the channel's cascade_reply
+    setting -- DMing a third party the answer to someone else's direct question
+    would be a strange thing to do.
+    """
+    channel = event["channel"]
+    reply_ts = event.get("thread_ts") or event.get("ts")
+
+    # Strip the leading @mention so the cascade sees the question, not the ping.
+    question = re.sub(r"<@[A-Z0-9]+>", " ", event.get("text", "")).strip()
+    if len(question) < 8:
+        SlackResponder(config.slack.bot_token).post_message(
+            channel,
+            "Ask me a product question and I'll check BetterBrain — e.g. "
+            "`@BetterBrain what's the max number of additional contributors?`",
+            thread_ts=reply_ts,
+        )
+        return
+
+    logger.info(f"Direct mention in {channel}; running BetterBrain cascade for: {question[:120]}")
+    answer, status = run_betterbrain_cascade(question, config.betterbrain)
+    log_gap(question, answer, channel, config.betterbrain, status=status)
+
+    responder = SlackResponder(config.slack.bot_token)
+    if answer:
+        responder.post_message(channel, answer, thread_ts=reply_ts)
+        logger.info(f"Answered direct mention in {channel}/{reply_ts}")
+    else:
+        # They asked directly, so they get a straight answer either way. Saying
+        # nothing to someone who @mentioned you is the worst option.
+        responder.post_message(
+            channel,
+            "I don't have a confident answer for that in BetterBrain, and my "
+            "escalation didn't turn one up either. Logged it as a gap.",
+            thread_ts=reply_ts,
+        )
+        logger.info(f"Direct mention in {channel} produced no answer (status={status})")
 
 
 def process_guru_decline(event: Dict[str, Any], config: Config):
