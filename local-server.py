@@ -20,6 +20,7 @@ Then:
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -121,13 +122,21 @@ def main():
     # tunnel-exposed endpoint). threads gives real concurrency for slow requests
     # (the multi-minute /author-article pass). Falls back to a non-debug Flask
     # server if waitress isn't installed.
+    # Bind loopback only. cloudflared runs on this same host and connects over
+    # localhost, so listening on 0.0.0.0 bought nothing and exposed the endpoint
+    # to every device on the LAN -- a path that bypasses the tunnel entirely.
+    # The Slack signature check is the whole security boundary here, so keep the
+    # number of ways to reach it as small as possible. Override with BIND_HOST
+    # if this ever runs somewhere the tunnel is not host-local (e.g. a container
+    # where the proxy is a separate network namespace).
+    host = os.getenv("BIND_HOST", "127.0.0.1")
     try:
         from waitress import serve
-        logger.info(f"Serving on 0.0.0.0:{port} via waitress (threads=8)")
-        serve(app, host='0.0.0.0', port=port, threads=8)
+        logger.info(f"Serving on {host}:{port} via waitress (threads=8)")
+        serve(app, host=host, port=port, threads=8)
     except ImportError:
         logger.warning("waitress not installed; using Flask server with debug OFF")
-        app.run(host='0.0.0.0', port=port, debug=False)
+        app.run(host=host, port=port, debug=False)
 
 
 if __name__ == '__main__':
