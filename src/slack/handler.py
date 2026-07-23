@@ -884,6 +884,44 @@ def parse_article_command(text: str) -> Optional[Dict[str, str]]:
     return {"topic": topic, "tmpl": tmpl, "area": area}
 
 
+def _article_scratch_dir(repo_path) -> Path:
+    """Where the bot reads/writes article scaffolds and drafts, so its ad-hoc, unreviewed
+    Slack drafts never dirty the tracked corpus checkout or append to its gap-manifest.jsonl
+    scoreboard -- codex's own `draft_support_article.py` runs still write into the repo.
+
+    A GITIGNORED dir INSIDE the repo (`.article-drafts-scratch/`), not /tmp, on purpose: the
+    /author-article pass runs `claude -p` with cwd=repo and --permission-mode acceptEdits,
+    which only auto-approves writes UNDER the working dir -- an external path blocks the write
+    on a permission prompt headless -p can't answer. .gitignore keeps it invisible to git.
+
+    Reaches the generator via BETTERBRAIN_ARTICLE_OUT_DIR and /author-article via a
+    `DRAFTS DIR = <path>` prompt line (claude -p can't inherit the env var). Persistent:
+    `write it:` re-authors from the scaffold left here. Overridable via
+    BETTERBRAIN_ARTICLE_OUT_DIR (keep the override within the repo so acceptEdits still covers it)."""
+    d = Path(os.getenv("BETTERBRAIN_ARTICLE_OUT_DIR") or (Path(str(repo_path)) / ".article-drafts-scratch"))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+_CLOSED_TITLE_RE = re.compile(r"^\s*-\s*(PKR-\d+)\s+—\s+(.+?)\s*$")
+
+
+def _closed_pkr_titles(gaps_text: str) -> list:
+    """Pull the `PKR-xxxxxx — title` lines under the manifest's **closed:** heading
+    (the PKRs newly documented by this draft). Scoped to that section so the
+    future-hold / verify-classic bullets below it don't bleed in."""
+    titles, in_closed = [], False
+    for line in gaps_text.splitlines():
+        if line.startswith("- **"):  # a top-level manifest heading
+            in_closed = line.startswith("- **closed:")
+            continue
+        if in_closed:
+            mt = _CLOSED_TITLE_RE.match(line)
+            if mt:
+                titles.append(f"{mt.group(1)} — {mt.group(2)}")
+    return titles
+
+
 def process_article_request(event: Dict[str, Any], config: Config):
     """Run draft_support_article.py against a support-requested topic and post the
     generated SCAFFOLD + gap manifest back to the thread. Deterministic and
@@ -908,6 +946,11 @@ def process_article_request(event: Dict[str, Any], config: Config):
         responder.post_message(channel, "BetterBrain repo isn't configured.", thread_ts=thread_ts)
         return
 
+    # Redirect all article output to a repo-external scratch dir so this ad-hoc,
+    # possibly-wrong draft never dirties the tracked corpus checkout or its scoreboard.
+    scratch = _article_scratch_dir(bb.repo_path)
+    gen_env = {**os.environ, "BETTERBRAIN_ARTICLE_OUT_DIR": str(scratch)}
+
     py = str(Path(str(bb.repo_path)) / ".venv" / "bin" / "python3")
     argv = [py, "scripts/draft_support_article.py", "--new", cmd["tmpl"], "--name", cmd["topic"],
             "--rerank", "--rerank-model", "mistral-small3.2"]
@@ -916,15 +959,15 @@ def process_article_request(event: Dict[str, Any], config: Config):
 
     responder.post_message(
         channel,
-        f"📝 Drafting a *{cmd['tmpl']}* article for *{cmd['topic']}*"
-        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''} — matching PKRs, then writing the "
-        "full draft. ~5-12 min…",
+        f"📝 Matching PKRs for a *{cmd['tmpl']}* article on *{cmd['topic']}*"
+        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''}… (~1 min). "
+        "I'll show what matched, then write the full draft only if the coverage checks out.",
         thread_ts=thread_ts,
     )
 
     try:
         result = subprocess.run(
-            argv, cwd=str(bb.repo_path), capture_output=True, text=True, timeout=180
+            argv, cwd=str(bb.repo_path), capture_output=True, text=True, timeout=180, env=gen_env
         )
     except subprocess.TimeoutExpired:
         responder.post_message(channel, "❌ Article generator timed out.", thread_ts=thread_ts)
@@ -954,25 +997,53 @@ def process_article_request(event: Dict[str, Any], config: Config):
     slug = m.group(1)
     closed = int(m.group(2))
     summary = m.group(0).strip()
-    out_dir = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
+    # The generator reports which distinctive topic term(s) appear in NONE of the
+    # matched PKRs -- "scope_mismatch=badge" means it matched Recognition records on
+    # the shared area word while the corpus has nothing on badges. "none" is the clear.
+    sm = re.search(r"scope_mismatch=(\S+)", result.stdout)
+    scope_terms = sm.group(1) if sm and sm.group(1) != "none" else ""
+    out_dir = scratch  # the generator wrote here via BETTERBRAIN_ARTICLE_OUT_DIR
     scaffold_f = out_dir / f"{slug}.scaffold.md"
     gaps_f = out_dir / f"{slug}.gaps.md"
-    logger.info(f"Generated scaffold '{slug}' for '{cmd['topic'][:80]}' (closed={closed})")
+    logger.info(
+        f"Generated scaffold '{slug}' for '{cmd['topic'][:80]}' "
+        f"(closed={closed} scope_mismatch={scope_terms or 'none'})"
+    )
 
-    responder.post_message(channel, f"📄 Matched *{closed}* PKR(s) for `{slug}`. `{summary}`", thread_ts=thread_ts)
+    # Surface the matched PKR titles inline, not just as a count -- the count can look
+    # healthy while the PKRs are about the wrong thing, and a reviewer should see what
+    # was matched BEFORE the multi-minute authoring spend, without opening the manifest.
+    titles = _closed_pkr_titles(gaps_f.read_text()) if gaps_f.exists() else []
+    matched_line = f"📄 Matched *{closed}* PKR(s) for `{slug}`. `{summary}`"
+    if titles:
+        shown = "\n".join(f"• {t}" for t in titles[:6])
+        extra = f"\n_…and {len(titles) - 6} more_" if len(titles) > 6 else ""
+        matched_line += f"\n{shown}{extra}"
+    responder.post_message(channel, matched_line, thread_ts=thread_ts)
     if gaps_f.exists():
         responder.post_message(channel, "*Gap manifest — what's covered vs. missing:*", thread_ts=thread_ts)
         _deliver_doc(responder, channel, thread_ts, f"{slug}.gaps.md", f"{slug} — gap manifest", gaps_f.read_text())
 
-    # Zero-coverage guard: don't spend a full authoring pass on a topic the corpus
-    # barely covers -- hand back the scaffold and let a human decide instead.
-    if closed == 0:
-        responder.post_message(
-            channel,
-            "The corpus has ~no durable knowledge on this yet, so I'm not auto-writing it. "
-            f"Scaffold attached; add PKR coverage, or force it with `@BetterBrain write it: {slug}`.",
-            thread_ts=thread_ts,
-        )
+    # Two reasons to stop before auto-authoring and hand the scaffold back instead:
+    #   closed == 0   -- the corpus has ~no durable knowledge on the topic.
+    #   scope_terms   -- it matched something, but the distinctive topic term is in
+    #                    none of it, so authoring would produce a confident article
+    #                    about the wrong feature. This is the failure the count misses.
+    if closed == 0 or scope_terms:
+        if scope_terms:
+            reason = (
+                f"⚠ The matched PKRs don't actually cover *{scope_terms.replace(',', ', ')}* — "
+                "the corpus likely has no durable knowledge of this exact topic (the matches came "
+                "from a shared product-area word). I'm not auto-writing it: that's how a confident "
+                "article about the wrong feature gets published. Check the matched PKRs above, then "
+                f"force it with `@BetterBrain write it: {slug}` if the topic is right."
+            )
+        else:
+            reason = (
+                "The corpus has ~no durable knowledge on this yet, so I'm not auto-writing it. "
+                f"Scaffold attached; add PKR coverage, or force it with `@BetterBrain write it: {slug}`."
+            )
+        responder.post_message(channel, reason, thread_ts=thread_ts)
         if scaffold_f.exists():
             _deliver_doc(responder, channel, thread_ts, f"{slug}.scaffold.md", f"{slug} — scaffold", scaffold_f.read_text())
         return
@@ -1025,10 +1096,22 @@ def _author_and_deliver(responder, channel, thread_ts, bb, slug: str) -> bool:
     it can write its output) and post the finished draft. Draft-only: keeps
     [SCREENSHOT]/[VERIFY] markers + PKR citations; nothing is published. Assumes
     <slug>.scaffold.md exists. Returns True on success."""
-    drafts = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts"
+    # Same repo-external scratch dir the generator wrote the scaffold to. `claude -p`
+    # does NOT propagate ambient env vars into its tool subprocesses (BETTERBRAIN_ARTICLE_OUT_DIR
+    # would arrive empty), so the path is passed as an explicit `DRAFTS DIR = <abs path>`
+    # line in the prompt -- the /author-article command reads the scaffold from and writes
+    # the finished .md into that directory, keeping the tracked corpus checkout clean.
+    drafts = _article_scratch_dir(bb.repo_path)
+    # Default to opus: in end-to-end testing it was the authoring model that caught a
+    # scope mismatch the deterministic matcher missed (an article titled for a feature
+    # the corpus has no PKRs on). Override with BETTERBRAIN_AUTHOR_MODEL to trade that
+    # safety margin for cost -- mirrors BETTERBRAIN_CASCADE_MODEL on the cascade path.
+    author_model = os.getenv("BETTERBRAIN_AUTHOR_MODEL", "opus")
     summary = _run_claude(
-        f"/author-article {slug}", cwd=str(bb.repo_path), timeout=AUTHOR_TIMEOUT_SECONDS,
-        extra_args=["--permission-mode", "acceptEdits"], label="author-article",
+        f"/author-article {slug}\n\nDRAFTS DIR = {drafts}",
+        cwd=str(bb.repo_path), timeout=AUTHOR_TIMEOUT_SECONDS,
+        extra_args=["--permission-mode", "acceptEdits", "--model", author_model],
+        label="author-article",
     )
     if summary is None:
         responder.post_message(channel, "❌ Authoring failed or timed out.", thread_ts=thread_ts)
@@ -1081,7 +1164,7 @@ def process_author_request(event: Dict[str, Any], config: Config):
         responder.post_message(channel, "BetterBrain repo isn't configured.", thread_ts=thread_ts)
         return
 
-    scaffold = Path(str(bb.repo_path)) / "knowledge-corpus" / "generated" / "article-drafts" / f"{slug}.scaffold.md"
+    scaffold = _article_scratch_dir(bb.repo_path) / f"{slug}.scaffold.md"
     if not scaffold.exists():
         responder.post_message(
             channel,
