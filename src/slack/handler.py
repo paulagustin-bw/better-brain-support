@@ -959,9 +959,9 @@ def process_article_request(event: Dict[str, Any], config: Config):
 
     responder.post_message(
         channel,
-        f"📝 Drafting a *{cmd['tmpl']}* article for *{cmd['topic']}*"
-        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''} — matching PKRs, then writing the "
-        "full draft. ~5-12 min…",
+        f"📝 Matching PKRs for a *{cmd['tmpl']}* article on *{cmd['topic']}*"
+        f"{' (area: ' + cmd['area'] + ')' if cmd['area'] else ''}… (~1 min). "
+        "I'll show what matched, then write the full draft only if the coverage checks out.",
         thread_ts=thread_ts,
     )
 
