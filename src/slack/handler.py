@@ -922,6 +922,24 @@ def _closed_pkr_titles(gaps_text: str) -> list:
     return titles
 
 
+_CONFLUENCE_TITLE_RE = re.compile(r"^\s*-\s*(\d+)\s+—\s+(.+?)\s*$")
+
+
+def _confluence_titles_from_gaps(gaps_text: str) -> list:
+    """Pull the `<page_id> — title` lines under the manifest's **related Confluence**
+    heading (advisory provenance; never article content), scoped to that section."""
+    titles, in_sec = [], False
+    for line in gaps_text.splitlines():
+        if line.startswith("- **"):
+            in_sec = line.startswith("- **related Confluence")
+            continue
+        if in_sec:
+            mt = _CONFLUENCE_TITLE_RE.match(line)
+            if mt:
+                titles.append(mt.group(2))
+    return titles
+
+
 def process_article_request(event: Dict[str, Any], config: Config):
     """Run draft_support_article.py against a support-requested topic and post the
     generated SCAFFOLD + gap manifest back to the thread. Deterministic and
@@ -1002,12 +1020,16 @@ def process_article_request(event: Dict[str, Any], config: Config):
     # the shared area word while the corpus has nothing on badges. "none" is the clear.
     sm = re.search(r"scope_mismatch=(\S+)", result.stdout)
     scope_terms = sm.group(1) if sm and sm.group(1) != "none" else ""
+    # A related Confluence PMD doc (design intent, not truth). On a dead-end draft this
+    # turns "no PKRs, sorry" into "author PKRs from this PMD doc first".
+    cr = re.search(r"confluence_refs=(\S+)", result.stdout)
+    confluence_refs = cr.group(1) if cr and cr.group(1) != "none" else ""
     out_dir = scratch  # the generator wrote here via BETTERBRAIN_ARTICLE_OUT_DIR
     scaffold_f = out_dir / f"{slug}.scaffold.md"
     gaps_f = out_dir / f"{slug}.gaps.md"
     logger.info(
         f"Generated scaffold '{slug}' for '{cmd['topic'][:80]}' "
-        f"(closed={closed} scope_mismatch={scope_terms or 'none'})"
+        f"(closed={closed} scope_mismatch={scope_terms or 'none'} confluence_refs={confluence_refs or 'none'})"
     )
 
     # Surface the matched PKR titles inline, not just as a count -- the count can look
@@ -1042,6 +1064,17 @@ def process_article_request(event: Dict[str, Any], config: Config):
             reason = (
                 "The corpus has ~no durable knowledge on this yet, so I'm not auto-writing it. "
                 f"Scaffold attached; add PKR coverage, or force it with `@BetterBrain write it: {slug}`."
+            )
+        # Gap-detection nudge: a matching Confluence PMD doc means the topic is real but
+        # unmined. Point at the author-PKRs-first workflow instead of leaving a dead end.
+        if confluence_refs:
+            pmd = _confluence_titles_from_gaps(gaps_f.read_text()) if gaps_f.exists() else []
+            named = "; ".join(f"*{t}*" for t in pmd[:2]) or f"page(s) {confluence_refs.replace(',', ', ')}"
+            reason += (
+                f"\n\n📄 There *is* a related Confluence PMD doc — {named}. That's design intent, not "
+                "confirmed behavior, so it can't be article truth on its own. The right next step is to "
+                "author PKR(s) from it — corroborated by a non-Confluence source (release notes / support "
+                "docs / implementation evidence, e.g. a GitHub check) — then re-run `draft article:`."
             )
         responder.post_message(channel, reason, thread_ts=thread_ts)
         if scaffold_f.exists():
